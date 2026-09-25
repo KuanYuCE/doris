@@ -70,6 +70,45 @@ class PackTest(unittest.TestCase):
         for name, group in existing.items():
             self.assertEqual(group, expanded[name], name)
 
+    def test_changing_fe_config_does_not_change_be_groups(self):
+        before = self.render()
+        after = self.render(["--var", "fe_config=sys_log_level = WARN\n"])
+        before_groups = {g["Name"]: g for g in before["TaskGroups"]}
+        for group in after["TaskGroups"]:
+            if group["Name"].startswith("be-"):
+                self.assertEqual(group, before_groups[group["Name"]])
+            else:
+                self.assertNotEqual(group, before_groups[group["Name"]])
+                prepare = next(t for t in group["Tasks"] if t["Name"] == "prepare")
+                config = next(t for t in prepare["Templates"] if t["DestPath"] == "local/fe-overrides.conf")
+                self.assertEqual(config["EmbeddedTmpl"], "sys_log_level = WARN\n")
+
+    def test_vault_credentials_are_runtime_templates(self):
+        job = self.render()
+        for group in job["TaskGroups"]:
+            for task in group["Tasks"]:
+                self.assertFalse(task["Vault"]["Env"])
+                self.assertTrue(task["Vault"]["DisableFile"])
+                templates = {t["DestPath"]: t for t in task["Templates"]}
+                self.assertIn('secret "kv-data/data/doris-secret/bootstrap"',
+                              templates["secrets/my.cnf"]["EmbeddedTmpl"])
+                if task["Name"] == "prepare" and group["Name"].startswith("fe-"):
+                    self.assertIn("secrets/root-password", templates)
+                else:
+                    self.assertNotIn("secrets/root-password", templates)
+
+    def test_nomad_variable_backend_remains_available(self):
+        job = self.render(["--var", "credential_source=nomad"])
+        for group in job["TaskGroups"]:
+            for task in group["Tasks"]:
+                self.assertIsNone(task["Vault"])
+                templates = {t["DestPath"]: t for t in task["Templates"]}
+                self.assertIn('nomadVar "nomad/jobs/doris"',
+                              templates["secrets/my.cnf"]["EmbeddedTmpl"])
+                self.assertNotIn("secrets/root-password", templates)
+                if task["Name"] == "prepare" and group["Name"].startswith("fe-"):
+                    self.assertIn("secrets/root-password-hash", templates)
+
 
 if __name__ == "__main__":
     unittest.main()

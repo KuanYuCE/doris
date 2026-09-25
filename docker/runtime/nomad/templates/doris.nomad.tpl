@@ -100,11 +100,15 @@ job [[ var "job_name" . | quote ]] {
         entrypoint = ["/bin/bash", "/local/prestart.sh"]
       }
       env {
-        NODE_KIND         = [[ $kind | quote ]]
-        NODE_IP           = [[ $node.ip | quote ]]
-        BOOTSTRAP_IP      = [[ $bootstrap | quote ]]
-        FE_CANDIDATES     = [[ join " " $seeds | quote ]]
-        DISCOVERY_TIMEOUT = [[ var "discovery_timeout" $root | toString | quote ]]
+        NODE_KIND             = [[ $kind | quote ]]
+        NODE_IP               = [[ $node.ip | quote ]]
+        BOOTSTRAP_IP          = [[ $bootstrap | quote ]]
+        FE_CANDIDATES         = [[ join " " $seeds | quote ]]
+        DISCOVERY_TIMEOUT     = [[ var "discovery_timeout" $root | toString | quote ]]
+        CONFIG_OVERRIDES_FILE = [[ printf "/local/%s-overrides.conf" $kind | quote ]]
+        [[ if and (eq $kind "fe") (eq (var "credential_source" $root) "vault") ]]
+        ROOT_PASSWORD_FILE = "/secrets/root-password"
+        [[ end ]]
       }
       volume_mount {
         volume      = "data"
@@ -116,7 +120,12 @@ job [[ var "job_name" . | quote ]] {
         once        = true
         data        = [[ fileContents (printf "%s/scripts/prestart.sh" (meta "pack.path" $root)) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
       }
-      [[ template "credentials" $root ]]
+      [[ if eq $kind "fe" ]]
+      [[ template "fe-config" $root ]]
+      [[ else ]]
+      [[ template "be-config" $root ]]
+      [[ end ]]
+      [[ template "credentials" (dict "root" $root "kind" $kind "prepare" true) ]]
       resources {
         cpu    = 100
         memory = 256
@@ -155,7 +164,7 @@ job [[ var "job_name" . | quote ]] {
         volume      = "data"
         destination = [[ printf "/opt/apache-doris/%s/%s" $kind (ternary "doris-meta" "storage" (eq $kind "fe")) | quote ]]
       }
-      [[ template "credentials" $root ]]
+      [[ template "credentials" (dict "root" $root "kind" $kind "prepare" false) ]]
       service {
         provider = "nomad"
         name     = [[ printf "%s-%s" (var "job_name" $root) $kind | quote ]]

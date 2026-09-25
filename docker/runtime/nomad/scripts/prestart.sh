@@ -23,6 +23,8 @@ DORIS_HOME=${DORIS_HOME:-/opt/apache-doris}
 ALLOC_DATA=${ALLOC_DATA:-/alloc/data}
 DORIS_MY_CNF=${DORIS_MY_CNF:-/secrets/my.cnf}
 ROOT_PASSWORD_HASH_FILE=${ROOT_PASSWORD_HASH_FILE:-/secrets/root-password-hash}
+ROOT_PASSWORD_FILE=${ROOT_PASSWORD_FILE:-}
+CONFIG_OVERRIDES_FILE=${CONFIG_OVERRIDES_FILE:-}
 DISCOVERY_TIMEOUT=${DISCOVERY_TIMEOUT:-300}
 POLL_INTERVAL=${POLL_INTERVAL:-2}
 
@@ -75,12 +77,41 @@ prepare_config() {
     mkdir -p "$ALLOC_DATA/conf"
     cp -a "$DORIS_HOME/$NODE_KIND/conf/." "$ALLOC_DATA/conf/"
     local conf="$ALLOC_DATA/conf/$NODE_KIND.conf"
+    if [[ -n $CONFIG_OVERRIDES_FILE ]]; then
+        # FE's Java Properties parser also accepts colon/whitespace separators
+        # and escaped/continued keys. Restrict fragments to the shared, explicit
+        # key=value syntax before checking keys tied to the pack's topology.
+        if ! awk '
+            /^[[:space:]]*($|#|!)/ { next }
+            /^[[:space:]]*[A-Za-z_][A-Za-z_0-9]*[[:space:]]*=/ {
+                if ($0 ~ /\\[[:space:]]*$/) exit 1
+                next
+            }
+            { exit 1 }
+        ' "$CONFIG_OVERRIDES_FILE"; then
+            fail "Use single-line key = value configuration without escaped keys or continuations"
+        fi
+        # These settings are coupled to the pack's mounts, reserved ports and
+        # upstream ASSIGN-mode scripts. Overriding them breaks the deployment.
+        local managed='meta_dir|storage_root_path|priority_networks|initial_root_password|enable_fqdn_mode|frontend_address|deploy_mode|http_port|rpc_port|query_port|edit_log_port|be_port|webserver_port|heartbeat_service_port|brpc_port|arrow_flight_sql_port'
+        if grep -Eq "^[[:space:]]*($managed)[[:space:]]*=" "$CONFIG_OVERRIDES_FILE"; then
+            fail "Configuration overrides a pack-managed path, port or identity setting"
+        fi
+        printf '\n' >> "$conf"
+        cat "$CONFIG_OVERRIDES_FILE" >> "$conf"
+    fi
     # Preserve distribution defaults (including JVM flags). Both upstream init
     # scripts append a /24 priority_networks on new nodes, so use the same subnet.
     printf '\npriority_networks = %s.0/24\n' "${NODE_IP%.*}" >> "$conf"
     if [[ $NODE_KIND == fe ]]; then
         local hash
-        hash=$(< "$ROOT_PASSWORD_HASH_FILE")
+        if [[ -n $ROOT_PASSWORD_FILE ]]; then
+            [[ -s $ROOT_PASSWORD_FILE ]] || fail "Vault root password is empty"
+            hash=$(openssl dgst -sha1 -binary "$ROOT_PASSWORD_FILE" |
+                openssl dgst -sha1 -r | awk '{print "*" toupper($1)}')
+        else
+            hash=$(< "$ROOT_PASSWORD_HASH_FILE")
+        fi
         [[ $hash =~ ^\*[A-F0-9]{40}$ ]] || fail "Invalid initial root password hash"
         printf 'initial_root_password = %s\n' "$hash" >> "$conf"
         printf 'meta_dir = %s/fe/doris-meta\n' "$DORIS_HOME" >> "$conf"

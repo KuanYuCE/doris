@@ -7,9 +7,10 @@
 ## 檔案與啟動流程
 
 - `templates/doris.nomad.tpl`：每個固定節點一個 group，包含 `prepare` 和 `doris` tasks。
-- `templates/_credentials.tpl`：從 Nomad Variables 產生權限 `0600` 的 `.my.cnf` 與初始密碼雜湊。
+- `templates/_credentials.tpl`：透過 Vault KV v2 與 Nomad HCL `template` blocks 產生權限 `0600` 的 `.my.cnf`。
+- `templates/_fe-config.tpl`、`templates/_be-config.tpl`：獨立的 FE／BE 設定片段 templates。
 - `scripts/prestart.sh`：在對應的 Doris image 內準備設定、探索 master、註冊新成員。
-- `scripts/credentials.py`：互動輸入密碼，產生 MySQL option file 與 Doris 密碼雜湊，再透過 stdin 寫入 Nomad。
+- `scripts/credentials.py`：僅供選用的 `credential_source="nomad"` 模式使用，不是 Vault 模式的必要步驟。
 - `examples/cluster.hcl`：3 FE + 3 BE 的 pack 變數。
 - `examples/client.hcl`：每台 Nomad client 所需的持久化 host volumes。
 
@@ -32,13 +33,40 @@ doris task
 `FE_MASTER_PORT`。它不取代原入口，也不常駐執行 discovery。只有短命的
 `prepare` task 覆寫自己的入口，以執行 prestart 腳本。
 
+## 一份 jobspec，不共用設定檔
+
+`doris.nomad.tpl` 是產生 Nomad job 的共同模板，不是 Doris 設定檔。每個 group
+有自己的 allocation；即使容器內都叫 `/alloc/data/conf`，它們也指向不同實體目錄。
+同一個 allocation 裡，只有 `prepare` 與 `doris` tasks 共用這個目錄。
+
+FE 從自己的 image 複製 `fe/conf`，加上 `_fe-config.tpl` 產生的設定，再掛載到
+`/opt/apache-doris/fe/conf`；BE 對應的是 `be/conf`、`_be-config.tpl` 與
+`/opt/apache-doris/be/conf`。可以在 pack 變數檔分別調整：
+
+```hcl
+fe_config = <<EOF
+sys_log_level = INFO
+EOF
+
+be_config = <<EOF
+sys_log_level = WARNING
+EOF
+```
+
+兩份設定是附加於 image defaults 的片段，避免重寫完整配置時遺漏 JVM flags 等
+發行版預設值。改 `fe_config` 不會改動 BE groups，反之亦然。但改 FE 共用設定
+仍會影響所有 FE groups，套用前需安排逐組 rollout 或維護停機。
+與 pack 綁定的資料路徑、ports、`priority_networks`、`initial_root_password`、
+FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
+片段使用單行 `key = value`；不支援 `key: value`、省略等號、跳脫 key 或反斜線續行。
+
 ## 前提
 
 本範例以 master `288e89103d` 的 Docker scripts 為依據；指定 image 必須具有相同契約：
 
 - FE entrypoint 為 `bash init_fe.sh`，BE 為 `bash entry_point.sh`。
 - 程式位於 `/opt/apache-doris`，支援 ASSIGN 模式與 FE `initial_root_password`。
-- image 內有 Bash、mysql client、GNU coreutils（含 `timeout`）及 awk。
+- image 內有 Bash、mysql client、OpenSSL、GNU coreutils（含 `timeout`）及 awk。
 - 使用 IPv4、host network、標準 Doris ports；每台 client 至多一個 FE、一個 BE。
 - hostname 是 **Nomad client node name**，不是 Doris FQDN；Doris membership 使用 `ip`。
 - IP 必須確實屬於該 host，且所在 `/24` 只能對應一個適用的介面位址。
@@ -60,25 +88,38 @@ doris task
 2. 複製 `examples/cluster.hcl` 到你自己的設定檔，填入 client name、IP、image、volume。
    `bootstrap_fe` 是首次建立叢集的唯一 FE，不代表永久 master。
    `discovery_fe_ips` 是穩定的 discovery seeds，建議為最初三台 FE。
-3. 建立 Nomad credentials variable（需 Nomad ACL 的相應 variable 寫入權限）：
+3. 使用既有的 Vault KV v2 secret：mount 為 `kv-data`，secret 路徑為
+   `doris-secret/bootstrap`，欄位為 `password`。pack 變數如下：
 
-   ```bash
-   python3 docker/runtime/nomad/scripts/credentials.py --job doris --namespace default
+   ```hcl
+   credential_source  = "vault"
+   vault_role         = "doris"
+   vault_secret_path  = "kv-data/data/doris-secret/bootstrap"
+   vault_password_key = "password"
    ```
 
-   工具互動詢問密碼，透過 stdin 傳給 `nomad var put`，不將密碼放進 argv、jobspec
-   或正常輸出。它使用 CAS=0，拒絕覆寫既有 variable。Nomad workload identity
-   必須能讀取 `nomad/jobs/doris`；自訂 namespace/job name 時要一致。
+   `vault_secret_path` 是 **API 路徑**，所以 KV v2 的 mount 後需要 `/data/`。
+   Nomad server/client 須已完成 Vault workload identity 整合（包含 default identity），
+   `vault_role` 請填入你實際使用的 Vault JWT auth role。角色所附 policy 至少需要：
 
-   Variable 有兩個 items：
-
-   ```text
-   my_cnf             = [client] 區段，包含正確跳脫的 password
-   root_password_hash = * + uppercase(hex(SHA1(SHA1(password))))
+   ```hcl
+   path "kv-data/data/doris-secret/bootstrap" {
+     capabilities = ["read"]
+   }
    ```
 
-   prestart 會把 hash 寫入 `fe.conf` 的 `initial_root_password`。第一次建立叢集
-   就使用這組 root 密碼，不需等 FE 起來後再執行 `SET PASSWORD`。
+   Nomad 在 task 啟動時透過 `secret` template function 讀取 Vault，並把密碼寫成
+   MySQL option file；`nomad-pack render` 階段不存取 Vault，也不會把密碼嵌入 jobspec。
+   `.my.cnf` 最終仍是 INI 格式，HCL 是描述它如何產生的設定。
+   Template 會跳脫密碼中的反斜線、雙引號、換行、CR 與 tab。
+
+   FE 的 `prepare` task 額外把同一 secret 的密碼原始 bytes 寫到自己的 `secrets/`
+   目錄，用 OpenSSL 計算 `* + uppercase(hex(SHA1(SHA1(password))))`，再寫入
+   `fe.conf` 的 `initial_root_password`。Vault 不需要另外儲存 hash。
+   第一次建立叢集就使用這組密碼，不需等 FE 起來後再執行 `SET PASSWORD`。
+
+   Vault token 不注入容器的環境變數或檔案；Nomad 管理 token 與 template 渲染。
+   這是固定 KV root 密碼的流程，不是 Vault database engine 的動態帳號流程。
 
 4. **僅限確定為全新叢集**：在 `bootstrap_fe` 對應的 host 上，於空白 FE 資料卷建立
    一次性授權檔：
@@ -172,14 +213,25 @@ FE group；確認 SQL 健康後再更新下一台。`max_parallel=1` 是 **每�
 - `.my.cnf` 只提供 mysql client 密碼；原有腳本仍寫死 `-uroot`，不能藉此換成其他帳號。
 - `initial_root_password` 不會改寫既有 metadata 的密碼。匯入已有叢集時，credentials
   必須匹配既有 root 密碼；空密碼叢集需先另外完成密碼遷移。
-- secret templates 使用 `once=true`；本範例沒有自動密碼輪替。變更 Nomad Variable
-  不等於執行 Doris `SET PASSWORD`，也不會讓既有 allocations 同步更新。
+- secret templates 使用 `once=true`；本範例沒有自動密碼輪替。變更 Vault KV
+  不等於執行 Doris `SET PASSWORD`，也不會讓既有 allocations 同步更新。不要在
+  bootstrap 或 rollout 中途修改 secret，否則不同 tasks 可能取得不同版本。
+  Vault token 更新使用 `change_mode="noop"`，不因 token 更新重啟 Doris。
 - Bootstrap permit 在主 FE 啟動前就被改名為 `.bootstrap-consumed`。如果此時失敗、
   尚未產生 `ROLE`/`VERSION`，會停止自動 bootstrap；需由操作人員確認叢集狀態後處理。
   不要把授權檔的建立放進每次開機或每次 allocation 的初始化。
 - 不可把 template 目錄或 `/alloc/data` 當作 Doris 資料卷；它們只放可重建設定。
 - 固定 client 保護節點身分與本地磁碟對應，但 client 永久故障不會自動遷移資料。
 - 此範例不配置 SQL TLS、網路防火牆或外部負載平衡器；依既有內網部署規範設定。
+
+若不用 Vault，可改成 `credential_source="nomad"`，再執行：
+
+```bash
+python3 docker/runtime/nomad/scripts/credentials.py --job doris --namespace default
+```
+
+此備用模式會透過 stdin 建立 `nomad/jobs/doris` 的 `my_cnf` 與 `root_password_hash`
+items，使用 CAS=0 拒絕覆寫既有 variable。使用 Vault 時不需要執行這個工具。
 
 ## 驗證
 
@@ -195,10 +247,17 @@ nomad-pack fmt -check -recursive docker/runtime/nomad
 `nomad-pack render` 與 `nomad job run -output`，檢查 shell 內容經模板處理後完整保留、
 主入口未被覆寫，以及擴容不會改變既有 groups。這些測試不等於真實叢集整合測試。
 
+若本機有 Vault CLI，測試另會啟動只監聽 loopback 的暫時 Vault dev server，使用
+合成密碼與真正的 Vault Agent 渲染同一份 templates，驗證 KV v2 讀取、特殊字元跳脫
+與原始密碼 bytes。此測試不使用任何既有 Vault address/token/namespace，結束後關閉。
+沒有 Vault CLI 時，這兩個整合測試會顯示 skipped。仍未驗證真實 Nomad/Vault JWT
+整合或 Doris 4.1.4 叢集啟動。
+
 上線前在測試環境驗證：首次 bootstrap、root 認證、停止原 master 後加入新 FE/BE、
 BE allocation 重新排程、全 FE 保留資料卷重啟、以及逐台 image 更新。
 
 參考：[Nomad lifecycle](https://developer.hashicorp.com/nomad/docs/job-specification/lifecycle)、
 [restart](https://developer.hashicorp.com/nomad/docs/job-specification/restart)、
 [allocation filesystem](https://developer.hashicorp.com/nomad/docs/concepts/filesystem)、
+[Vault integration](https://developer.hashicorp.com/nomad/docs/secure/workload-identity/vault)、
 [Doris initial_root_password](https://doris.apache.org/docs/3.x/admin-manual/config/fe-config/#initial_root_password)。

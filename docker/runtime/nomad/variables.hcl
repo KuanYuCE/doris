@@ -18,13 +18,13 @@
 variable "job_name" {
   type        = string
   default     = "doris"
-  description = "Stable job ID; credentials live at nomad/jobs/<job_name>."
+  description = "Stable job ID."
 }
 
 variable "namespace" {
   type        = string
   default     = "default"
-  description = "Nomad namespace containing the job and its credentials."
+  description = "Nomad namespace containing the job."
 }
 
 variable "datacenters" {
@@ -91,4 +91,40 @@ variable "be_memory" {
   type        = number
   default     = 16384
   description = "BE memory limit in MiB."
+}
+
+variable "credential_source" {
+  type        = string
+  default     = "vault"
+  description = "Use vault (KV v2) or nomad (the original Nomad Variables helper)."
+}
+
+variable "vault_secret_path" {
+  type        = string
+  default     = "kv-data/data/doris-secret/bootstrap"
+  description = "KV v2 API path, including /data/ after the mount name."
+}
+
+variable "vault_password_key" {
+  type        = string
+  default     = "password"
+  description = "Password field inside the KV v2 secret's Data.data map."
+}
+
+variable "vault_role" {
+  type        = string
+  default     = "doris"
+  description = "Vault JWT auth role for the configured Nomad/Vault workload identity integration."
+}
+
+variable "fe_config" {
+  type        = string
+  default     = ""
+  description = "FE configuration appended to image defaults. Pack-managed paths, ports and identity settings cannot be overridden."
+}
+
+variable "be_config" {
+  type        = string
+  default     = ""
+  description = "BE configuration appended to image defaults, independently of FE configuration."
 }

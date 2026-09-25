@@ -19,6 +19,20 @@ job_name    = "doris"
 namespace   = "default"
 datacenters = ["dc1"]
 
+credential_source  = "vault"
+vault_role         = "doris"
+vault_secret_path  = "kv-data/data/doris-secret/bootstrap"
+vault_password_key = "password"
+
+# Independent configuration fragments; image defaults remain in effect.
+fe_config = <<EOF
+sys_log_level = INFO
+EOF
+
+be_config = <<EOF
+sys_log_level = INFO
+EOF
+
 bootstrap_fe     = "10.0.0.11"
 discovery_fe_ips = ["10.0.0.11", "10.0.0.12", "10.0.0.13"]
 

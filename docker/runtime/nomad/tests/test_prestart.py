@@ -129,6 +129,47 @@ class PrestartTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.endpoint(), "10.0.0.3")
 
+    def test_vault_password_generates_initial_hash(self):
+        password = self.base / "root-password"
+        password.write_bytes(b"root@123")
+        self.env["ROOT_PASSWORD_FILE"] = str(password)
+        (self.base / "hash").unlink()
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("initial_root_password = *A00C34073A26B40AB4307650BFB9309D6BFA6999",
+                      (self.data / "conf/fe.conf").read_text())
+        self.assertNotIn("root@123", result.stdout + result.stderr)
+
+    def test_component_config_is_appended_to_image_defaults(self):
+        overrides = self.base / "overrides.conf"
+        overrides.write_text("sys_log_level = WARN\n")
+        self.env["CONFIG_OVERRIDES_FILE"] = str(overrides)
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        conf = (self.data / "conf/fe.conf").read_text()
+        self.assertIn("custom_option = preserved", conf)
+        self.assertIn("sys_log_level = WARN", conf)
+
+    def test_component_config_cannot_change_membership_ports(self):
+        overrides = self.base / "overrides.conf"
+        overrides.write_text("query_port = 9999\n")
+        self.env["CONFIG_OVERRIDES_FILE"] = str(overrides)
+        result = self.run_prestart()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("managed", result.stderr)
+
+    def test_component_config_rejects_alternate_java_property_syntax(self):
+        overrides = self.base / "overrides.conf"
+        self.env["CONFIG_OVERRIDES_FILE"] = str(overrides)
+        for content in ("query_port: 9999\n", "query_port 9999\n",
+                        "query\\_port = 9999\n", "query_\\\nport = 9999\n",
+                        "sys_log_level = INFO\\\nquery_port = 9999\n"):
+            with self.subTest(content=content):
+                overrides.write_text(content)
+                result = self.run_prestart()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("single-line", result.stderr)
+
     def test_seed_returns_master_outside_seed_list(self):
         self.env["TEST_REACHABLE_HOSTS"] = "10.0.0.2 10.0.0.4"
         (self.base / "frontends").write_text(FRONTENDS.replace("10.0.0.2", "10.0.0.4"))
