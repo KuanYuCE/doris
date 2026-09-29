@@ -200,17 +200,38 @@ FE `/api/health`。兩者都**不代表 metadata 已追平或 BE 所有 tablet �
 
 每個服務都帶 `tags = [<fe|be>, <port 名稱>]` 與 `meta.node = <Nomad client name>`。
 
-### sql-ready check
+### sql-ready check（`scripts/ready.sh`）
 
-Nomad 在主容器內執行 `/bin/bash /local/ready.sh`，使用同一份 `/secrets/my.cnf`：
+**目的**：判斷節點是否真的可以使用，而不只是 port 已開啟。TCP check 在 9030／9050
+開始監聽時就會通過，但此時 FE 可能尚未 Join、仍在追 metadata 或看不到 master，
+BE 可能尚未註冊或 FE 尚未收到它的 heartbeat。`update` 區塊依 checks 判斷部署健康，
+只看 TCP 時，逐台升級可能在上一台 FE 真的可用之前就開始更新下一台。
 
-- FE：詢問本機 FE 的 `SHOW FRONTENDS`，自身列（IP + EditLogPort 9010）須
-  `Join = true`、`Alive = true`，且看得到 `IsMaster = true`、`Alive = true` 的列。
-- BE：依序詢問 prestart 選定的 master（經 `BASH_ENV` 取得）與 `discovery_fe_ips`，
-  由第一台有回應的 FE 確認自身列（IP + HeartbeatPort 9050）`Alive = true`。
+**判斷方式**：Nomad 在主容器內執行 `/bin/bash /local/ready.sh`，使用同一份
+`/secrets/my.cnf` 以 root 帳號執行 SQL：
 
-失敗時回傳 2（critical），不回傳 1（warning）。check 只影響健康狀態與 DNS，
-不設定 `check_restart`，不會因 master 暫時不可用而重啟 Doris。
+- FE（`ready.sh fe <ip>`）：詢問本機 FE 的 `SHOW FRONTENDS`，自身列
+  （IP + EditLogPort 9010）須 `Join = true`、`Alive = true`，且看得到
+  `IsMaster = true`、`Alive = true` 的列。
+- BE（`ready.sh be <ip> <seed>...`）：依序詢問 prestart 選定的 master
+  （經 `BASH_ENV` 取得 `FE_MASTER_IP`）與 `discovery_fe_ips`，由第一台有回應的 FE
+  確認自身列（IP + HeartbeatPort 9050）`Alive = true`。
+
+通過時回傳 0（passing）；失敗時輸出原因（例如 `FE 10.0.0.12 is not joined and
+alive`，可在 Consul UI 的 check output 查看）並回傳 2（critical），不回傳 1
+（Consul 視為 warning）。
+
+**影響範圍**：
+
+- 部署：check 通過前，該 allocation 不算健康，不會進行下一步 rollout。
+- Consul DNS 與服務查詢：只回傳通過 check 的節點，例如 `doris-fe.service.consul`。
+- prestart 的 Consul 探索：`local/consul-fe` 只列出健康的 FE，新節點只向可用的 FE
+  詢問 master。
+- 不重啟 Doris：未設定 `check_restart`，master 暫時不可用等狀況只改變健康狀態。
+
+**限制**：只在 `service_provider = "consul"` 時產生（Nomad 內建 provider 不支援
+script check）。它不檢查 metadata 是否追平（例如 `ReplayedJournalId`），也不檢查
+BE tablet 健康；升級下一台 FE 前仍應以 SQL 確認追趕狀態。
 
 ### `/api/health`
 
