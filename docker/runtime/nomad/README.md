@@ -103,7 +103,9 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
   與主機容量配置資源。FE 與 BE 同機時，兩者 reservation 必須都能滿足。
 - 依 Doris 正式部署要求預先設定主機，例如 BE 的 `vm.max_map_count`、磁碟、時鐘同步等。
 
-本地驗證工具版本：Nomad Pack 0.4.2、Nomad 2.0.4。範例 image tag 為使用者指定的
+需要 **Nomad Pack 0.4.2 以上**：模板以 `meta "pack.path"` 讀取 `scripts/` 內容，
+此 metadata 自 0.4.2 才提供，0.4.1 會在 render 時回報 `no such file or directory`。
+本地驗證工具版本：Nomad Pack 0.4.2、Nomad 2.0.4／2.0.7。範例 image tag 為使用者指定的
 `apache/doris:fe-4.1.4`／`apache/doris:be-4.1.4`；尚未對這兩個發行 image 執行叢集整合測試。
 上線前先檢查 image 的 entrypoint、工具、設定及實際 SQL 輸出；正式使用建議固定 digest。
 
