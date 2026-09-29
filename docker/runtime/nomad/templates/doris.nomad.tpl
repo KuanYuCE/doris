@@ -29,6 +29,8 @@
 [[ if not (has $bootstrap $ips) ]][[ fail "bootstrap_fe must occur in fe_nodes" ]][[ end ]]
 [[ $seeds := var "discovery_fe_ips" . ]]
 [[ if not $seeds ]][[ fail "discovery_fe_ips must not be empty" ]][[ end ]]
+[[ $provider := var "service_provider" . ]]
+[[ if not (has $provider (list "nomad" "consul")) ]][[ fail "service_provider must be nomad or consul" ]][[ end ]]
 
 job [[ var "job_name" . | quote ]] {
   namespace   = [[ var "namespace" . | quote ]]
@@ -166,7 +168,7 @@ job [[ var "job_name" . | quote ]] {
       }
       [[ template "credentials" (dict "root" $root "kind" $kind "prepare" false) ]]
       service {
-        provider = "nomad"
+        provider = [[ $provider | quote ]]
         name     = [[ printf "%s-%s" (var "job_name" $root) $kind | quote ]]
         port     = [[ ternary "query" "heartbeat" (eq $kind "fe") | quote ]]
         address  = [[ $node.ip | quote ]]

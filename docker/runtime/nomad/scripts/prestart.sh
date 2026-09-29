@@ -57,14 +57,6 @@ master_from() {
         }'
 }
 
-member_present() {
-    local port_column=$1 port=$2
-    awk -F '\t' -v ip="$NODE_IP" -v pc="$port_column" -v port="$port" '
-        NR == 1 { for (i=1; i<=NF; i++) c[$i]=i; next }
-        c["Host"] && c[pc] && $(c["Host"]) == ip && $(c[pc]) == port { found=1 }
-        END { exit !found }'
-}
-
 write_endpoint() {
     validate_ip "$1"
     printf 'export FE_MASTER_IP=%s\nexport FE_MASTER_PORT=9010\n' "$1" \
@@ -149,6 +141,10 @@ main() {
         fi
     fi
 
+    # Only discover the current master. Membership is left to the unchanged
+    # image entrypoint: in ASSIGN mode init_fe.sh / init_be.sh check SHOW
+    # FRONTENDS / SHOW BACKENDS and run ALTER SYSTEM ADD FOLLOWER / BACKEND
+    # for a node with empty metadata or storage, then start it.
     local deadline=$((SECONDS + DISCOVERY_TIMEOUT)) master rows verified
     local saw_master=false
     while ((SECONDS < deadline)); do
@@ -162,20 +158,11 @@ main() {
             # Recheck the master's own view; it may have changed during discovery.
             verified=$(sql "$master" 'SHOW FRONTENDS') || continue
             [[ $(master_from <<< "$verified") == "$master" ]] || continue
-            if [[ $NODE_KIND == fe ]]; then
-                if ! member_present EditLogPort 9010 <<< "$verified"; then
-                    sql "$master" "ALTER SYSTEM ADD FOLLOWER '$NODE_IP:9010'" >/dev/null || continue
-                    verified=$(sql "$master" 'SHOW FRONTENDS') || continue
-                    member_present EditLogPort 9010 <<< "$verified" || continue
-                fi
-            else
-                rows=$(sql "$master" 'SHOW BACKENDS') || continue
-                if ! member_present HeartbeatPort 9050 <<< "$rows"; then
-                    sql "$master" "ALTER SYSTEM ADD BACKEND '$NODE_IP:9050'" >/dev/null || continue
-                    rows=$(sql "$master" 'SHOW BACKENDS') || continue
-                    member_present HeartbeatPort 9050 <<< "$rows" || continue
-                fi
-            fi
+            # init_fe.sh starts FE_MASTER_IP == FE_CURRENT_IP as a new master
+            # without --helper. A node without metadata can never be the
+            # elected master, so this would create a second cluster.
+            [[ $NODE_KIND == be || $master != "$NODE_IP" ]] ||
+                fail "An FE without metadata is reported as master; check its volume"
             write_endpoint "$master"
             return
         done
@@ -190,7 +177,7 @@ main() {
         write_endpoint "$NODE_IP"
         return
     fi
-    fail "No usable master/registration before timeout; bootstrap requires an unused permit on the designated FE"
+    fail "No usable master before timeout; bootstrap requires an unused permit on the designated FE"
 }
 
 main "$@"

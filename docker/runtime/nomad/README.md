@@ -9,7 +9,7 @@
 - `templates/doris.nomad.tpl`：每個固定節點一個 group，包含 `prepare` 和 `doris` tasks。
 - `templates/_credentials.tpl`：透過 Vault KV v2 與 Nomad HCL `template` blocks 產生權限 `0600` 的 `.my.cnf`。
 - `templates/_fe-config.tpl`、`templates/_be-config.tpl`：獨立的 FE／BE 設定片段 templates。
-- `scripts/prestart.sh`：在對應的 Doris image 內準備設定、探索 master、註冊新成員。
+- `scripts/prestart.sh`：在對應的 Doris image 內準備設定、探索 master、把關 bootstrap。
 - `scripts/credentials.py`：僅供選用的 `credential_source="nomad"` 模式使用，不是 Vault 模式的必要步驟。
 - `examples/cluster.hcl`：3 FE + 3 BE 的 pack 變數。
 - `examples/client.hcl`：每台 Nomad client 所需的持久化 host volumes。
@@ -18,8 +18,7 @@
 prepare task (prestart, sidecar=false)
   ├─ 複製該 image 的 conf 到 /alloc/data/conf
   ├─ FE 有 ROLE + VERSION → 直接放行，不等 SQL/master
-  ├─ 新 FE / BE → 輪詢 discovery seeds → SHOW FRONTENDS 找現任 master
-  │                                      → 檢查/新增 membership
+  ├─ 新 FE / BE → 輪詢 discovery seeds → SHOW FRONTENDS 找現任 master（只讀）
   └─ 寫入 /alloc/data/endpoint.env
                 ↓
 doris task
@@ -27,7 +26,26 @@ doris task
   ├─ /root/.my.cnf ← 該 task 的 secrets/my.cnf
   ├─ /opt/apache-doris/{fe,be}/conf ← prestart 複製的設定
   └─ 原本 image 的 ENTRYPOINT（不覆寫 command / args / entrypoint）
+       └─ ASSIGN 模式：新節點由 init_fe.sh / init_be.sh 自行
+          ALTER SYSTEM ADD FOLLOWER / BACKEND 後啟動
 ```
+
+### prestart 與原入口的分工
+
+原入口已經會註冊新成員，prestart 不再下任何 `ALTER SYSTEM`，只做原入口做不到的事：
+
+| 工作 | 負責者 | 原因 |
+| --- | --- | --- |
+| `SHOW FRONTENDS`/`SHOW BACKENDS` 檢查、`ALTER SYSTEM ADD FOLLOWER/BACKEND` | 原入口 | `init_fe.sh` 在 metadata 為空、`init_be.sh` 在 `storage/data` 不存在時執行 |
+| 找出現任 master | prestart | ASSIGN 模式需要固定的 `FE_MASTER_IP`，原入口不會探索；master 會漂移 |
+| 決定是否 bootstrap 新叢集 | prestart | 原入口看到 `FE_MASTER_IP == FE_CURRENT_IP` 就以新 master 啟動，沒有防止第二個叢集的機制 |
+| 既有 FE 不等 quorum 直接放行 | prestart | 將 `FE_MASTER_IP` 設為自己，原入口直接啟動既有 metadata |
+| 複製設定、附加片段、`initial_root_password` | prestart | 原入口不支援設定片段或密碼 hash |
+
+代價：原入口的 `check_fe_registered` 在節點尚未註冊時會先輪詢 60 秒才執行
+`ALTER SYSTEM ADD FOLLOWER`，所以新 FE 加入約多等一分鐘。原入口把 SQL 錯誤導到
+`/dev/null`；註冊失敗時看 `doris` task 的 `Failed to register ...` 訊息，並用
+prestart 日誌確認當時使用的 master 與認證都正常。
 
 `BASH_ENV` 利用 Bash 啟動時載入環境檔的功能，只設定 `FE_MASTER_IP` 與
 `FE_MASTER_PORT`。它不取代原入口，也不常駐執行 discovery。只有短命的
@@ -155,15 +173,34 @@ Nomad 的服務檢查為 TCP listener，**不代表 metadata 已追平、quorum 
 所有 tablet 都健康**。以已認證的 SQL 執行 `SHOW FRONTENDS`、`SHOW BACKENDS`
 驗證所有預期成員、Alive、master 與 metadata 追趕狀態後，再接受流量或更新下一台。
 
+## Service provider：nomad 或 consul
+
+預設 `service_provider = "nomad"`，使用 Nomad 內建服務目錄；設為 `"consul"` 則
+註冊到 Consul。本 pack 的 discovery 用的是 `discovery_fe_ips`，**不讀服務目錄**，
+所以兩者都不影響叢集形成；差別在於服務註冊給誰用：
+
+- `nomad`：不需額外元件；只支援 `tcp`/`http` checks，服務查詢透過 Nomad API 或
+  template 的 `nomadService`，沒有 DNS。
+- `consul`：可用 `<job>-fe.service.consul` DNS 給 MySQL client／負載平衡器使用，
+  支援 `script`/`grpc` checks，並能與既有 Consul 生態（consul-template、ACL、
+  跨 datacenter 查詢）整合。需要每台 client 都有 Consul agent，以及 Nomad 對
+  Consul 的整合（Nomad 1.7+ 為 workload identity／ACL token）。
+
+已經運行 Consul 的環境建議改用 `consul`；沒有 Consul 時不必為此導入。兩種 provider
+的 check 都會作為 `update` 區塊的部署健康依據。目前 check 仍是 TCP listener。
+切換 provider 會改動每個 group，需依上文的逐組 rollout 或維護停機方式套用。
+
 ## 重啟與 master 切換
 
 既有 FE 的 `ROLE`、`VERSION` 都存在時，prestart 不等待 master，直接放行，讓 FEs
 同時啟動並自行選舉。缺失部分 identity files 或已有不完整 metadata 時會退出，
 不把它當作新叢集。
 
-BE 每次新 allocation 都重新探索 master。prestart 已替新 BE 註冊 membership，
-但原有 BE entrypoint 的 status check 仍保留：FE 若在此時故障，主 task 仍可能退出。
-這版靠重新排程，再跑一次 discovery 收斂，並不承諾啟動過程完全沒有重試。
+BE 每次新 allocation 都重新探索 master，新 BE 由原有 `init_be.sh` 註冊。
+原有 BE entrypoint 的 status check 只等 60 秒：FE 若在此時故障或 master 切換，
+主 task 可能退出。這版靠重新排程，再跑一次 discovery 收斂，並不承諾啟動過程完全沒有重試。
+同理，新 FE 若在 prestart 後遇到 master 切換，原入口的 `ALTER SYSTEM` 仍可經
+follower 轉送；若舊 master 已不可連線則該 allocation 失敗、重新排程後以新 master 重試。
 
 已成功的 ephemeral prestart 不會因主 task 一般的 restart 自動再跑。因此設定為：
 

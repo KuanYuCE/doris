@@ -97,6 +97,18 @@ class PackTest(unittest.TestCase):
                 else:
                     self.assertNotIn("secrets/root-password", templates)
 
+    def test_service_provider_is_selectable(self):
+        for provider in ("nomad", "consul"):
+            with self.subTest(provider=provider):
+                job = self.render(["--var", f"service_provider={provider}"])
+                for group in job["TaskGroups"]:
+                    main = next(t for t in group["Tasks"] if t["Name"] == "doris")
+                    self.assertEqual([s["Provider"] for s in main["Services"]], [provider])
+
+    def test_unknown_service_provider_is_rejected(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.render(["--var", "service_provider=dns"])
+
     def test_nomad_variable_backend_remains_available(self):
         job = self.render(["--var", "credential_source=nomad"])
         for group in job["TaskGroups"]:

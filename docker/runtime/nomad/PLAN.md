@@ -13,8 +13,8 @@ endpoint discovery in an ephemeral prestart task.
    bypass discovery; a new member must use an available elected master; no master
    must time out; partial metadata must fail; bootstrap requires a one-use permit.
 2. Implement prestart using the matching Doris image. Copy its configuration to
-   the allocation directory, generate `BASH_ENV` with validated addresses, and
-   register new members before invoking the unchanged upstream entrypoint.
+   the allocation directory and generate `BASH_ENV` with the validated master;
+   the unchanged upstream entrypoint registers new members.
 3. Render one group per stable node with pinned host volumes and host networking.
    Disable local task restart and reschedule failed allocations so prestart runs
    again. Preserve per-node image selection for deliberate one-FE-at-a-time upgrades.
@@ -65,3 +65,14 @@ environment for a standalone deployment example.
 - Nomad's existing Vault workload identity integration and the selected JWT role
   must authorize secret reads. Token renewal does not trigger Doris restarts;
   credential rotation remains an explicit operation.
+
+## Entrypoint registration and service provider follow-up
+
+- Prestart no longer issues `ALTER SYSTEM`. In ASSIGN mode `init_fe.sh` and
+  `init_be.sh` already check membership and register nodes with empty metadata
+  or storage. Prestart keeps only what they cannot do: master discovery, the
+  bootstrap permit, and configuration. It refuses a master equal to a new FE's
+  own IP, which the entrypoint would otherwise start as a second cluster.
+- Cost: `init_fe.sh` polls 60 seconds for membership before registering a new FE.
+- `service_provider` selects nomad (default) or consul. Discovery still uses the
+  static seeds, so the provider only affects consumers of the registration.

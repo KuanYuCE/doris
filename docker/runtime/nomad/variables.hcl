@@ -93,6 +93,12 @@ variable "be_memory" {
   description = "BE memory limit in MiB."
 }
 
+variable "service_provider" {
+  type        = string
+  default     = "nomad"
+  description = "Register FE/BE services with nomad (built-in) or consul (requires Consul on every client)."
+}
+
 variable "credential_source" {
   type        = string
   default     = "vault"

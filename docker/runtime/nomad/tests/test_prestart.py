@@ -61,6 +61,8 @@ class PrestartTest(unittest.TestCase):
             "base = Path(os.environ['TEST_BASE'])\n"
             "host = sys.argv[sys.argv.index('-h') + 1]\n"
             "sql = sys.argv[-1]\n"
+            "with (base / 'queries').open('a') as f:\n"
+            "    f.write(sql + '\\n')\n"
             "if host not in os.environ.get('TEST_REACHABLE_HOSTS', '10.0.0.2').split() or os.environ.get('TEST_OFFLINE'):\n"
             "    sys.exit(1)\n"
             "if sql == 'SHOW FRONTENDS':\n"
@@ -68,15 +70,6 @@ class PrestartTest(unittest.TestCase):
             "    if not table.exists():\n"
             "        table = base / 'frontends'\n"
             "    print(table.read_text(), end='')\n"
-            "elif sql == 'SHOW BACKENDS':\n"
-            "    print('BackendId\\tHost\\tHeartbeatPort\\tAlive')\n"
-            "    if (base / 'registered').exists():\n"
-            "        print('10001\\t10.0.0.3\\t9050\\tfalse')\n"
-            "elif sql.startswith('ALTER SYSTEM ADD BACKEND'):\n"
-            "    (base / 'registered').touch()\n"
-            "elif sql.startswith('ALTER SYSTEM ADD FOLLOWER'):\n"
-            "    with (base / 'frontends').open('a') as f:\n"
-            "        f.write('fe3\\tfalse\\t10.0.0.3\\t9010\\t8030\\t9030\\t9020\\tFOLLOWER\\t123\\ttrue\\tfalse\\t0\\tNULL\\tNULL\\tfalse\\t\\t4.1.4\\tNo\\n')\n"
             "else:\n"
             "    sys.exit(2)\n"
         )
@@ -104,17 +97,22 @@ class PrestartTest(unittest.TestCase):
             text=True, capture_output=True, timeout=10,
         )
 
+    def queries(self):
+        path = self.base / "queries"
+        return path.read_text().splitlines() if path.exists() else []
+
     def endpoint(self):
         return subprocess.check_output(
             ["bash", "-c", 'printf "%s" "$FE_MASTER_IP"'],
             env=dict(self.env, BASH_ENV=str(self.data / "endpoint.env")), text=True,
         )
 
-    def test_new_fe_uses_surviving_master_and_registers(self):
+    def test_new_fe_uses_surviving_master_and_leaves_registration(self):
         result = self.run_prestart()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.endpoint(), "10.0.0.2")
-        self.assertIn("10.0.0.3\t9010", (self.base / "frontends").read_text())
+        # init_fe.sh registers the follower; prestart only reads membership.
+        self.assertEqual(set(self.queries()), {"SHOW FRONTENDS"})
         conf = (self.data / "conf/fe.conf").read_text()
         self.assertIn("custom_option = preserved", conf)
         self.assertIn("initial_root_password = *" + "A" * 40, conf)
@@ -209,18 +207,29 @@ class PrestartTest(unittest.TestCase):
     def test_existing_cluster_wins_over_bootstrap_permit(self):
         self.env["NODE_IP"] = "10.0.0.1"
         (self.meta / ".bootstrap-approved").touch()
-        # Existing cluster doesn't contain fe1. The fake registration adds fe3,
-        # so registration verification must fail rather than create a cluster.
+        # An elected master exists, so the designated FE joins it as a
+        # follower instead of consuming the permit and creating a cluster.
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.2")
+        self.assertTrue((self.meta / ".bootstrap-approved").exists())
+        self.assertFalse((self.meta / ".bootstrap-consumed").exists())
+
+    def test_new_fe_reported_as_master_fails(self):
+        self.env["TEST_REACHABLE_HOSTS"] = "10.0.0.2 10.0.0.3"
+        (self.base / "frontends").write_text(FRONTENDS.replace("10.0.0.2", "10.0.0.3"))
         result = self.run_prestart()
         self.assertNotEqual(result.returncode, 0)
-        self.assertTrue((self.meta / ".bootstrap-approved").exists())
+        self.assertIn("without metadata", result.stderr)
+        self.assertFalse((self.data / "endpoint.env").exists())
 
-    def test_be_registers_before_upstream_start(self):
+    def test_be_leaves_registration_to_upstream_entrypoint(self):
         self.env["NODE_KIND"] = "be"
         result = self.run_prestart()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.endpoint(), "10.0.0.2")
-        self.assertTrue((self.base / "registered").exists())
+        # init_be.sh runs SHOW BACKENDS / ALTER SYSTEM ADD BACKEND itself.
+        self.assertEqual(set(self.queries()), {"SHOW FRONTENDS"})
 
     def test_no_master_times_out_without_endpoint(self):
         self.env["TEST_OFFLINE"] = "1"

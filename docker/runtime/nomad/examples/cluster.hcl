@@ -19,6 +19,9 @@ job_name    = "doris"
 namespace   = "default"
 datacenters = ["dc1"]
 
+# Set to "consul" when every Nomad client runs a Consul agent (DNS, script checks).
+service_provider = "nomad"
+
 credential_source  = "vault"
 vault_role         = "doris"
 vault_secret_path  = "kv-data/data/doris-secret/bootstrap"
