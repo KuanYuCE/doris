@@ -11,8 +11,8 @@
 - `templates/_fe-config.tpl`、`templates/_be-config.tpl`：獨立的 FE／BE 設定片段 templates。
 - `scripts/prestart.sh`：在對應的 Doris image 內準備設定、探索 master、把關 bootstrap。
 - `scripts/ready.sh`：Consul script check，在主容器內以已認證 SQL 判斷節點是否可用。
-- `examples/cluster.hcl`：3 FE + 3 BE 的 pack 變數。
-- `examples/client.hcl`：每台 Nomad client 所需的持久化 host volumes。
+- `examples/cluster.hcl`：pack 的 **var-file** 範例（3 FE + 3 BE），以 `nomad-pack -f` 傳入。
+- `examples/client.hcl`：Nomad client agent 設定（持久化 host volumes），**不是** var-file。
 
 ```text
 prepare task (prestart, sidecar=false)
@@ -160,6 +160,18 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
    才消耗這份授權並允許初始化。這個操作是磁碟初次佈署的一部分，不需另一套 pack。
 
 ## 部署
+
+`bootstrap_fe`、`discovery_fe_ips`、`fe_nodes`、`be_nodes` 沒有預設值，必須由 var-file
+提供；其他變數的預設值見 `variables.hcl`。只想確認 pack 能否 render 與通過驗證時，
+可直接使用範例 var-file（不需連線 Nomad、Consul 或 Vault）：
+
+```bash
+nomad-pack render docker/runtime/nomad -f docker/runtime/nomad/examples/cluster.hcl \
+  --to-dir /tmp/doris-render --auto-approve
+nomad job validate /tmp/doris-render/doris/doris.nomad
+```
+
+實際部署時，使用依自己環境修改後的 var-file：
 
 ```bash
 nomad-pack render docker/runtime/nomad -f /path/to/cluster.hcl \

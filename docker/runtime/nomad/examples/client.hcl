@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Nomad client agent configuration, not a pack variable file.
 # Merge into each designated Nomad client's configuration. Create these
 # directories on the correct persistent disk before starting the client.
 client {

@@ -15,6 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Nomad Pack variable file: pass it with `nomad-pack render|plan|run -f`.
+# bootstrap_fe, discovery_fe_ips, fe_nodes and be_nodes have no defaults and
+# must be set; every other value here overrides a default in variables.hcl.
+# This is not Nomad agent configuration; see client.hcl for that.
+
 job_name    = "doris"
 namespace   = "default"
 datacenters = ["dc1"]
