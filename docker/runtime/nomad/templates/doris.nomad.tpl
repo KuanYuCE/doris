@@ -119,10 +119,14 @@ job [[ var "job_name" . | quote ]] {
         CONSUL_FE_FILE = "/local/consul-fe"
         [[ end ]]
       }
+      [[ if eq $kind "fe" ]]
+      # Prestart inspects ROLE/VERSION and consumes the bootstrap permit. It
+      # never touches BE storage; init_be.sh checks that in the main task.
       volume_mount {
         volume      = "data"
-        destination = [[ printf "/opt/apache-doris/%s/%s" $kind (ternary "doris-meta" "storage" (eq $kind "fe")) | quote ]]
+        destination = "/opt/apache-doris/fe/doris-meta"
       }
+      [[ end ]]
       template {
         destination = "local/prestart.sh"
         perms       = "0644"

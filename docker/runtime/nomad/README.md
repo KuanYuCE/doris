@@ -7,6 +7,8 @@
 ## 檔案與啟動流程
 
 - `templates/doris.nomad.tpl`：每個固定節點一個 group，包含 `prepare` 和 `doris` tasks。
+  資料卷在 group 宣告一次；FE 的 `prepare` 需讀寫 metadata（判斷 `ROLE`／`VERSION`、
+  消耗 bootstrap permit）才掛載，BE 的 `prepare` 不掛載 storage。
 - `templates/_credentials.tpl`：透過 Vault KV v2 與 Nomad HCL `template` blocks 產生權限 `0600` 的 `.my.cnf`。
 - `templates/_fe-config.tpl`、`templates/_be-config.tpl`：獨立的 FE／BE 設定片段 templates。
 - `scripts/prestart.sh`：在對應的 Doris image 內準備設定、探索 master、把關 bootstrap。

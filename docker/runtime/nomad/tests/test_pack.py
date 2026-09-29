@@ -62,6 +62,23 @@ class PackTest(unittest.TestCase):
                              (ROOT / "scripts/prestart.sh").read_text())
             self.assertEqual(templates["secrets/my.cnf"]["Perms"], "0600")
 
+    def test_only_fe_prepare_mounts_the_data_volume(self):
+        job = self.render()
+        for group in job["TaskGroups"]:
+            kind = group["Name"].split("-")[0]
+            tasks = {t["Name"]: t for t in group["Tasks"]}
+            data_dir = "doris-meta" if kind == "fe" else "storage"
+            main_mounts = [(m["Volume"], m["Destination"], bool(m["ReadOnly"]))
+                           for m in tasks["doris"]["VolumeMounts"]]
+            self.assertEqual(main_mounts, [("data", f"/opt/apache-doris/{kind}/{data_dir}", False)])
+            prepare_mounts = [(m["Volume"], m["Destination"], bool(m["ReadOnly"]))
+                              for m in tasks["prepare"]["VolumeMounts"] or []]
+            if kind == "fe":
+                # Read-write: prestart renames the bootstrap permit.
+                self.assertEqual(prepare_mounts, [("data", "/opt/apache-doris/fe/doris-meta", False)])
+            else:
+                self.assertEqual(prepare_mounts, [])
+
     def test_adding_fe_does_not_change_existing_groups(self):
         before = self.render()
         nodes = [dict(ip=f"10.0.0.{10+i}", hostname=f"doris-{i}", volume="doris-fe",
