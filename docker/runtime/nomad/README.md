@@ -142,7 +142,8 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
 
    FE 的 `prepare` task 額外把同一 secret 的密碼原始 bytes 寫到自己的 `secrets/`
    目錄，用 OpenSSL 計算 `* + uppercase(hex(SHA1(SHA1(password))))`，再寫入
-   `fe.conf` 的 `initial_root_password`。Vault 不需要另外儲存 hash。
+   `fe.conf` 的 `initial_root_password`。Vault 不需要另外儲存 hash；原因與兩種
+   檔案格式見「一份密碼、兩種格式」。
    第一次建立叢集就使用這組密碼，不需等 FE 起來後再執行 `SET PASSWORD`。
 
    Vault token 不注入容器的環境變數或檔案；Nomad 管理 token 與 template 渲染。
@@ -329,9 +330,35 @@ FE group；確認 SQL 健康後再更新下一台。`max_parallel=1` 是 **每�
 - 固定 client 保護節點身分與本地磁碟對應，但 client 永久故障不會自動遷移資料。
 - 此範例不配置 SQL TLS、網路防火牆或外部負載平衡器；依既有內網部署規範設定。
 
-Vault KV v2 是唯一的密碼來源。Vault secret 必須保存**明文**密碼：`initial_root_password`
-只決定首次 bootstrap 的 root 密碼，之後原入口、prestart 與 `ready.sh` 的 mysql
-client 都以 `my.cnf` 中的明文密碼登入。不要另外在 `fe_config` 設定
+### 一份密碼、兩種格式：`my.cnf` 與 `root-password`
+
+Vault KV v2 是唯一的密碼來源，secret 必須保存**明文** root 密碼。各 task 啟動時
+從同一個 secret 產生兩種格式的檔案（皆 `once = true`、權限 `0600`），內容一定一致：
+
+| 檔案 | 格式 | 產生於 | 用途 |
+| --- | --- | --- | --- |
+| `secrets/my.cnf` | INI，密碼經跳脫（`\`、`"`、換行、CR、tab） | 所有 FE／BE 的 `prepare` 與 `doris` tasks | mysql client 以 root 登入：原入口、prestart、`ready.sh` |
+| `secrets/root-password` | 原始 bytes，不跳脫、無前後空白 | 只有 FE 的 `prepare` task | prestart 計算 `initial_root_password` |
+
+**為什麼要計算 hash**：Doris 的 `initial_root_password` 只接受 2-staged SHA-1 格式
+`* + uppercase(hex(SHA1(SHA1(password))))`，例如 `root@123` 對應
+`*A00C34073A26B40AB4307650BFB9309D6BFA6999`（等同 `SELECT PASSWORD('root@123')`）。
+若誤填明文，FE 只記錄 WARN `initial_root_password is not valid 2-staged SHA-1
+encrypted, ignore it` 並照常啟動，**root 會沒有密碼**。此設定也只在 master FE
+第一次啟動時套用，之後修改不會生效。
+
+**為什麼另存原始 bytes，而不從 `my.cnf` 計算**：Nomad template 沒有 SHA1 函式，
+hash 只能在 prestart 計算；若從 `my.cnf` 計算，必須先在 Bash 中還原 INI 跳脫，
+差一個 byte 就會產生錯誤的 hash，而且要到登入失敗才會發現。另存一份原始 bytes，
+讓 OpenSSL 直接對正確輸入計算。
+
+**為什麼只有 FE `prepare` 需要 `root-password`**：`be.conf` 沒有
+`initial_root_password`（root 帳號只存在 FE metadata），FE 主 task 使用 prestart
+已準備好的 `fe.conf`。這個區分只為了不產生沒人讀取的檔案，並非安全邊界：
+`my.cnf` 本來就含有同一個明文密碼。
+
+**不能以 hash 取代明文**：`initial_root_password` 只決定首次 bootstrap 的密碼，
+之後所有 mysql client 都以 `my.cnf` 的明文登入。也不要在 `fe_config` 自行設定
 `initial_root_password`；它屬於 pack 管理的設定，prestart 會拒絕。
 
 ## 驗證
