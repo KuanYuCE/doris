@@ -16,6 +16,9 @@
 # under the License.
 
 [[ $root := . ]]
+[[/* meta "pack.path" only exists from Nomad Pack 0.4.2. The root variable
+     file's absolute path is available in 0.4.1 and later. */]]
+[[ $packPath := dir (index . "_self").Pack.RootVariableFile.Path ]]
 [[ $feNodes := var "fe_nodes" . ]]
 [[ $beNodes := var "be_nodes" . ]]
 [[ $bootstrap := var "bootstrap_fe" . ]]
@@ -123,7 +126,7 @@ job [[ var "job_name" . | quote ]] {
         destination = "local/prestart.sh"
         perms       = "0644"
         once        = true
-        data        = [[ fileContents (printf "%s/scripts/prestart.sh" (meta "pack.path" $root)) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
+        data        = [[ fileContents (printf "%s/scripts/prestart.sh" $packPath) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
       }
       [[ if eq $provider "consul" ]]
       # Healthy (SQL-ready) FEs at task start. An empty list is valid: the
@@ -188,7 +191,7 @@ EOF
         destination = "local/ready.sh"
         perms       = "0644"
         once        = true
-        data        = [[ fileContents (printf "%s/scripts/ready.sh" (meta "pack.path" $root)) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
+        data        = [[ fileContents (printf "%s/scripts/ready.sh" $packPath) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
       }
       [[ end ]]
       service {
