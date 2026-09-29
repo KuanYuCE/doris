@@ -74,5 +74,16 @@ environment for a standalone deployment example.
   bootstrap permit, and configuration. It refuses a master equal to a new FE's
   own IP, which the entrypoint would otherwise start as a second cluster.
 - Cost: `init_fe.sh` polls 60 seconds for membership before registering a new FE.
-- `service_provider` selects nomad (default) or consul. Discovery still uses the
-  static seeds, so the provider only affects consumers of the registration.
+- `service_provider` selects consul (default) or nomad.
+
+## Consul follow-up
+
+- Default provider is consul. Every node gets tags and `meta.node`; FEs also
+  register `<job>-fe-http` with a `/api/health` check (503 until ready).
+- `scripts/ready.sh` is a Consul script check run in the main container with the
+  task's option file: FE must be joined, alive and see an alive master; BE must
+  be alive in SHOW BACKENDS from the prestart master or a seed. Checks gate
+  deployments but never restart Doris.
+- Prestart prepends healthy FEs from a once-rendered Consul template to the
+  static seeds. Seeds remain required for bootstrap and catalog outages.
+- The nomad provider keeps TCP and HTTP checks only.

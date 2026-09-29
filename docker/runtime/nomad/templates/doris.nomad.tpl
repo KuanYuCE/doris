@@ -108,6 +108,9 @@ job [[ var "job_name" . | quote ]] {
         FE_CANDIDATES         = [[ join " " $seeds | quote ]]
         DISCOVERY_TIMEOUT     = [[ var "discovery_timeout" $root | toString | quote ]]
         CONFIG_OVERRIDES_FILE = [[ printf "/local/%s-overrides.conf" $kind | quote ]]
+        [[ if eq $provider "consul" ]]
+        CONSUL_FE_FILE = "/local/consul-fe"
+        [[ end ]]
         [[ if and (eq $kind "fe") (eq (var "credential_source" $root) "vault") ]]
         ROOT_PASSWORD_FILE = "/secrets/root-password"
         [[ end ]]
@@ -122,6 +125,18 @@ job [[ var "job_name" . | quote ]] {
         once        = true
         data        = [[ fileContents (printf "%s/scripts/prestart.sh" (meta "pack.path" $root)) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
       }
+      [[ if eq $provider "consul" ]]
+      # Healthy (SQL-ready) FEs at task start. An empty list is valid: the
+      # static seeds still cover bootstrap and a new catalog.
+      template {
+        destination = "local/consul-fe"
+        once        = true
+        data        = <<EOF
+{{ range service [[ printf "%s-fe" (var "job_name" $root) | quote ]] }}{{ .Address }}
+{{ end }}
+EOF
+      }
+      [[ end ]]
       [[ if eq $kind "fe" ]]
       [[ template "fe-config" $root ]]
       [[ else ]]
@@ -167,18 +182,62 @@ job [[ var "job_name" . | quote ]] {
         destination = [[ printf "/opt/apache-doris/%s/%s" $kind (ternary "doris-meta" "storage" (eq $kind "fe")) | quote ]]
       }
       [[ template "credentials" (dict "root" $root "kind" $kind "prepare" false) ]]
+      [[ $port := ternary "query" "heartbeat" (eq $kind "fe") ]]
+      [[ if eq $provider "consul" ]]
+      template {
+        destination = "local/ready.sh"
+        perms       = "0644"
+        once        = true
+        data        = [[ fileContents (printf "%s/scripts/ready.sh" (meta "pack.path" $root)) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
+      }
+      [[ end ]]
       service {
         provider = [[ $provider | quote ]]
         name     = [[ printf "%s-%s" (var "job_name" $root) $kind | quote ]]
-        port     = [[ ternary "query" "heartbeat" (eq $kind "fe") | quote ]]
+        port     = [[ $port | quote ]]
         address  = [[ $node.ip | quote ]]
+        tags     = [[ list $kind $port | toJson ]]
+        meta {
+          node = [[ $node.hostname | quote ]]
+        }
         check {
           name     = "tcp-listener"
           type     = "tcp"
           interval = "10s"
           timeout  = "2s"
         }
+        [[ if eq $provider "consul" ]]
+        # Authenticated membership readiness; also gates deployments.
+        check {
+          name     = "sql-ready"
+          type     = "script"
+          command  = "/bin/bash"
+          args     = [[ concat (list "/local/ready.sh" $kind $node.ip) (ternary (list) $seeds (eq $kind "fe")) | toJson ]]
+          interval = "15s"
+          timeout  = "10s"
+        }
+        [[ end ]]
       }
+      [[ if eq $kind "fe" ]]
+      service {
+        provider = [[ $provider | quote ]]
+        name     = [[ printf "%s-fe-http" (var "job_name" $root) | quote ]]
+        port     = "http"
+        address  = [[ $node.ip | quote ]]
+        tags     = ["fe", "http"]
+        meta {
+          node = [[ $node.hostname | quote ]]
+        }
+        # Public endpoint; returns 503 until the FE has finished starting.
+        check {
+          name     = "api-health"
+          type     = "http"
+          path     = "/api/health"
+          interval = "10s"
+          timeout  = "2s"
+        }
+      }
+      [[ end ]]
       resources {
         cpu    = [[ var (printf "%s_cpu" $kind) $root ]]
         memory = [[ var (printf "%s_memory" $kind) $root ]]

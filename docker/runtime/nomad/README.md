@@ -10,6 +10,7 @@
 - `templates/_credentials.tpl`：透過 Vault KV v2 與 Nomad HCL `template` blocks 產生權限 `0600` 的 `.my.cnf`。
 - `templates/_fe-config.tpl`、`templates/_be-config.tpl`：獨立的 FE／BE 設定片段 templates。
 - `scripts/prestart.sh`：在對應的 Doris image 內準備設定、探索 master、把關 bootstrap。
+- `scripts/ready.sh`：Consul script check，在主容器內以已認證 SQL 判斷節點是否可用。
 - `scripts/credentials.py`：僅供選用的 `credential_source="nomad"` 模式使用，不是 Vault 模式的必要步驟。
 - `examples/cluster.hcl`：3 FE + 3 BE 的 pack 變數。
 - `examples/client.hcl`：每台 Nomad client 所需的持久化 host volumes。
@@ -18,7 +19,8 @@
 prepare task (prestart, sidecar=false)
   ├─ 複製該 image 的 conf 到 /alloc/data/conf
   ├─ FE 有 ROLE + VERSION → 直接放行，不等 SQL/master
-  ├─ 新 FE / BE → 輪詢 discovery seeds → SHOW FRONTENDS 找現任 master（只讀）
+  ├─ 新 FE / BE → 輪詢 Consul 中健康的 FE + discovery seeds
+  │              → SHOW FRONTENDS 找現任 master（只讀）
   └─ 寫入 /alloc/data/endpoint.env
                 ↓
 doris task
@@ -28,6 +30,11 @@ doris task
   └─ 原本 image 的 ENTRYPOINT（不覆寫 command / args / entrypoint）
        └─ ASSIGN 模式：新節點由 init_fe.sh / init_be.sh 自行
           ALTER SYSTEM ADD FOLLOWER / BACKEND 後啟動
+                ↓
+Consul services（預設 service_provider = "consul"）
+  ├─ <job>-fe：9030，TCP + sql-ready script check
+  ├─ <job>-fe-http：8030，GET /api/health
+  └─ <job>-be：9050，TCP + sql-ready script check
 ```
 
 ### prestart 與原入口的分工
@@ -90,6 +97,8 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
 - IP 必須確實屬於該 host，且所在 `/24` 只能對應一個適用的介面位址。
   原有 entrypoint 會自行附加 `/24` 的 `priority_networks`，本 pack 不修改它。
 - Nomad client 已配置持久化 host volumes；資料不能放在 ephemeral allocation 目錄。
+- 預設使用 Consul：每台 client 需有 Consul agent，Nomad 已完成 Consul 整合；
+  沒有 Consul 時設 `service_provider = "nomad"`。
 - 範例 FE memory 為 16 GiB，以容納 image 常見的 8 GiB JVM heap；請對照實際 image
   與主機容量配置資源。FE 與 BE 同機時，兩者 reservation 必須都能滿足。
 - 依 Doris 正式部署要求預先設定主機，例如 BE 的 `vm.max_map_count`、磁碟、時鐘同步等。
@@ -169,26 +178,64 @@ nomad alloc logs <allocation-id> prepare
 nomad alloc logs <allocation-id> doris
 ```
 
-Nomad 的服務檢查為 TCP listener，**不代表 metadata 已追平、quorum 可寫或 BE
-所有 tablet 都健康**。以已認證的 SQL 執行 `SHOW FRONTENDS`、`SHOW BACKENDS`
-驗證所有預期成員、Alive、master 與 metadata 追趕狀態後，再接受流量或更新下一台。
+使用 Consul 時，`sql-ready` check 以已認證 SQL 確認 FE 已 Join、Alive 且看得到
+存活的 master，BE 在 `SHOW BACKENDS` 中為 Alive；`nomad` provider 只有 TCP 與
+FE `/api/health`。兩者都**不代表 metadata 已追平或 BE 所有 tablet 都健康**，
+更新下一台 FE 前仍應以 SQL 確認 `ReplayedJournalId` 等追趕狀態。
 
-## Service provider：nomad 或 consul
+## Service provider：consul（預設）或 nomad
 
-預設 `service_provider = "nomad"`，使用 Nomad 內建服務目錄；設為 `"consul"` 則
-註冊到 Consul。本 pack 的 discovery 用的是 `discovery_fe_ips`，**不讀服務目錄**，
-所以兩者都不影響叢集形成；差別在於服務註冊給誰用：
+預設 `service_provider = "consul"`。所有 checks 都會作為 `update` 區塊的部署健康依據：
+`max_parallel = 1` 的 group 更新會等節點真正可用，才算健康。
 
-- `nomad`：不需額外元件；只支援 `tcp`/`http` checks，服務查詢透過 Nomad API 或
-  template 的 `nomadService`，沒有 DNS。
-- `consul`：可用 `<job>-fe.service.consul` DNS 給 MySQL client／負載平衡器使用，
-  支援 `script`/`grpc` checks，並能與既有 Consul 生態（consul-template、ACL、
-  跨 datacenter 查詢）整合。需要每台 client 都有 Consul agent，以及 Nomad 對
-  Consul 的整合（Nomad 1.7+ 為 workload identity／ACL token）。
+| 功能 | `consul` | `nomad` |
+| --- | --- | --- |
+| `<job>-fe`（9030）、`<job>-be`（9050），TCP check | 有 | 有 |
+| `<job>-fe-http`（8030），`GET /api/health` | 有 | 有 |
+| `sql-ready` script check（`scripts/ready.sh`） | 有 | 不支援 script check |
+| prestart 從服務目錄探索 FE | 有 | 無，只用 `discovery_fe_ips` |
+| DNS（例如 `doris-fe.service.consul`） | 有 | 無 |
 
-已經運行 Consul 的環境建議改用 `consul`；沒有 Consul 時不必為此導入。兩種 provider
-的 check 都會作為 `update` 區塊的部署健康依據。目前 check 仍是 TCP listener。
-切換 provider 會改動每個 group，需依上文的逐組 rollout 或維護停機方式套用。
+每個服務都帶 `tags = [<fe|be>, <port 名稱>]` 與 `meta.node = <Nomad client name>`。
+
+### sql-ready check
+
+Nomad 在主容器內執行 `/bin/bash /local/ready.sh`，使用同一份 `/secrets/my.cnf`：
+
+- FE：詢問本機 FE 的 `SHOW FRONTENDS`，自身列（IP + EditLogPort 9010）須
+  `Join = true`、`Alive = true`，且看得到 `IsMaster = true`、`Alive = true` 的列。
+- BE：依序詢問 prestart 選定的 master（經 `BASH_ENV` 取得）與 `discovery_fe_ips`，
+  由第一台有回應的 FE 確認自身列（IP + HeartbeatPort 9050）`Alive = true`。
+
+失敗時回傳 2（critical），不回傳 1（warning）。check 只影響健康狀態與 DNS，
+不設定 `check_restart`，不會因 master 暫時不可用而重啟 Doris。
+
+### `/api/health`
+
+FE 尚未完成啟動時回 503；目前 master 程式碼中此端點一律不需認證。較舊版本在
+`enable_all_http_auth = true` 時會要求認證，兩種 provider 的這個 check 都會持續
+失敗並卡住部署；請先在實際 image 上確認 `curl -i http://<fe>:8030/api/health`
+回 200，否則升級 image 或關閉該設定。
+
+### 從 Consul 探索 FE
+
+`prepare` task 以 template 讀取 `<job>-fe` 中**健康**（`sql-ready` 通過）的位址，
+寫到 `/local/consul-fe`，放在 `discovery_fe_ips` 前面依序嘗試並去重。
+Template 使用 `once = true`，只在 task 啟動時讀一次。首次 bootstrap 時目錄為空，
+仍依靠靜態 seeds 與 bootstrap permit；Consul 不可用時 template 會阻塞，重試用盡後
+allocation 失敗並重新排程。因此 `discovery_fe_ips` 仍為必填。
+
+### Consul 前提
+
+- 每台 Nomad client 的 Consul agent 正常運作，Nomad client 已設定 `consul` 區塊。
+- 啟用 Consul ACL 時，Nomad 須設定 Consul workload identity（Nomad 1.7+ 的
+  `service_identity` 與 `task_identity`），讓服務註冊與 `prepare` task 的
+  `service` template 取得 token；task identity 對應的 policy 至少需要
+  `service "<job>-fe" { policy = "read" }` 與 `node_prefix "" { policy = "read" }`。
+- 沒有 Consul 時設定 `service_provider = "nomad"`，功能依上表縮減。
+
+切換 provider 或升級到本版會改動每個 group 的 services，需依上文的逐組 rollout
+或維護停機方式套用。
 
 ## 重啟與 master 切換
 
@@ -275,7 +322,7 @@ items，使用 CAS=0 拒絕覆寫既有 variable。使用 Vault 時不需要執�
 在 repository root 執行：
 
 ```bash
-bash -n docker/runtime/nomad/scripts/prestart.sh
+bash -n docker/runtime/nomad/scripts/prestart.sh docker/runtime/nomad/scripts/ready.sh
 python3 -m unittest discover -s docker/runtime/nomad/tests -v
 nomad-pack fmt -check -recursive docker/runtime/nomad
 ```

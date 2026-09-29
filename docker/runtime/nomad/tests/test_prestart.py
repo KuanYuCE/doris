@@ -87,7 +87,9 @@ class PrestartTest(unittest.TestCase):
             NODE_IP="10.0.0.3",
             BOOTSTRAP_IP="10.0.0.1",
             FE_CANDIDATES="10.0.0.1 10.0.0.2 10.0.0.3",
-            DISCOVERY_TIMEOUT="1",
+            # Bash SECONDS counts whole wall-clock seconds, so a deadline of 1
+            # can expire almost immediately. 2 leaves at least one second.
+            DISCOVERY_TIMEOUT="2",
             POLL_INTERVAL="0.1",
         )
 
@@ -174,6 +176,33 @@ class PrestartTest(unittest.TestCase):
         result = self.run_prestart()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.endpoint(), "10.0.0.4")
+
+    def test_consul_registered_fe_extends_static_seeds(self):
+        # The only reachable FE is registered in Consul but is not a seed.
+        self.env["TEST_REACHABLE_HOSTS"] = "10.0.0.5"
+        (self.base / "frontends").write_text(FRONTENDS.replace("10.0.0.2", "10.0.0.5"))
+        consul = self.base / "consul-fe"
+        consul.write_text("10.0.0.5\n10.0.0.1\n\n")
+        self.env["CONSUL_FE_FILE"] = str(consul)
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.5")
+
+    def test_empty_consul_catalog_uses_static_seeds(self):
+        consul = self.base / "consul-fe"
+        consul.write_text("\n")
+        self.env["CONSUL_FE_FILE"] = str(consul)
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.2")
+
+    def test_invalid_consul_address_fails(self):
+        consul = self.base / "consul-fe"
+        consul.write_text("doris-fe.example\n")
+        self.env["CONSUL_FE_FILE"] = str(consul)
+        result = self.run_prestart()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid IPv4", result.stderr)
 
     def test_leadership_changes_between_discovery_and_verification(self):
         self.env["TEST_REACHABLE_HOSTS"] = "10.0.0.1 10.0.0.2 10.0.0.4"

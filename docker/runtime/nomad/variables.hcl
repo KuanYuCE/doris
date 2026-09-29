@@ -95,8 +95,8 @@ variable "be_memory" {
 
 variable "service_provider" {
   type        = string
-  default     = "nomad"
-  description = "Register FE/BE services with nomad (built-in) or consul (requires Consul on every client)."
+  default     = "consul"
+  description = "Register FE/BE services with consul (default; requires Consul on every client) or nomad (built-in)."
 }
 
 variable "credential_source" {

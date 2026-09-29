@@ -97,13 +97,47 @@ class PackTest(unittest.TestCase):
                 else:
                     self.assertNotIn("secrets/root-password", templates)
 
-    def test_service_provider_is_selectable(self):
-        for provider in ("nomad", "consul"):
-            with self.subTest(provider=provider):
-                job = self.render(["--var", f"service_provider={provider}"])
-                for group in job["TaskGroups"]:
-                    main = next(t for t in group["Tasks"] if t["Name"] == "doris")
-                    self.assertEqual([s["Provider"] for s in main["Services"]], [provider])
+    def test_consul_services_checks_and_discovery(self):
+        job = self.render()
+        for group in job["TaskGroups"]:
+            kind = group["Name"].split("-")[0]
+            tasks = {t["Name"]: t for t in group["Tasks"]}
+            prepare, main = tasks["prepare"], tasks["doris"]
+            services = {s["Name"]: s for s in main["Services"]}
+            expected = {f"doris-{kind}"} | ({"doris-fe-http"} if kind == "fe" else set())
+            self.assertEqual(set(services), expected)
+            for service in services.values():
+                self.assertEqual(service["Provider"], "consul")
+                self.assertEqual(service["Tags"][0], kind)
+            checks = {c["Name"]: c for c in services[f"doris-{kind}"]["Checks"]}
+            ready = checks["sql-ready"]
+            self.assertEqual(ready["Type"], "script")
+            self.assertEqual(ready["Args"][:2], ["/local/ready.sh", kind])
+            if kind == "be":
+                # BE readiness asks the static seeds after the prestart master.
+                self.assertEqual(ready["Args"][3:], ["10.0.0.11", "10.0.0.12", "10.0.0.13"])
+            else:
+                self.assertEqual(len(ready["Args"]), 3)
+                http = services["doris-fe-http"]["Checks"][0]
+                self.assertEqual((http["Type"], http["Path"]), ("http", "/api/health"))
+            templates = {t["DestPath"]: t for t in main["Templates"]}
+            self.assertEqual(templates["local/ready.sh"]["EmbeddedTmpl"],
+                             (ROOT / "scripts/ready.sh").read_text())
+            prepare_templates = {t["DestPath"]: t for t in prepare["Templates"]}
+            self.assertIn('service "doris-fe"', prepare_templates["local/consul-fe"]["EmbeddedTmpl"])
+            self.assertEqual(prepare["Env"]["CONSUL_FE_FILE"], "/local/consul-fe")
+
+    def test_nomad_service_provider_has_no_consul_features(self):
+        job = self.render(["--var", "service_provider=nomad"])
+        for group in job["TaskGroups"]:
+            tasks = {t["Name"]: t for t in group["Tasks"]}
+            prepare, main = tasks["prepare"], tasks["doris"]
+            for service in main["Services"]:
+                self.assertEqual(service["Provider"], "nomad")
+                self.assertTrue(all(c["Type"] in ("tcp", "http") for c in service["Checks"]))
+            self.assertNotIn("local/ready.sh", {t["DestPath"] for t in main["Templates"]})
+            self.assertNotIn("local/consul-fe", {t["DestPath"] for t in prepare["Templates"]})
+            self.assertNotIn("CONSUL_FE_FILE", prepare["Env"])
 
     def test_unknown_service_provider_is_rejected(self):
         with self.assertRaises(subprocess.CalledProcessError):

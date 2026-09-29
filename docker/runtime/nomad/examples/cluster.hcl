@@ -19,8 +19,9 @@ job_name    = "doris"
 namespace   = "default"
 datacenters = ["dc1"]
 
-# Set to "consul" when every Nomad client runs a Consul agent (DNS, script checks).
-service_provider = "nomad"
+# consul adds SQL readiness checks, Consul discovery and DNS; use "nomad"
+# when the clients do not run a Consul agent.
+service_provider = "consul"
 
 credential_source  = "vault"
 vault_role         = "doris"

@@ -25,6 +25,7 @@ DORIS_MY_CNF=${DORIS_MY_CNF:-/secrets/my.cnf}
 ROOT_PASSWORD_HASH_FILE=${ROOT_PASSWORD_HASH_FILE:-/secrets/root-password-hash}
 ROOT_PASSWORD_FILE=${ROOT_PASSWORD_FILE:-}
 CONFIG_OVERRIDES_FILE=${CONFIG_OVERRIDES_FILE:-}
+CONSUL_FE_FILE=${CONSUL_FE_FILE:-}
 DISCOVERY_TIMEOUT=${DISCOVERY_TIMEOUT:-300}
 POLL_INTERVAL=${POLL_INTERVAL:-2}
 
@@ -122,6 +123,21 @@ main() {
     local -a candidates
     read -r -a candidates <<< "$FE_CANDIDATES"
     local candidate
+    if [[ -n $CONSUL_FE_FILE ]]; then
+        # Healthy FEs registered in Consul, rendered once when the task starts.
+        # Try them before the static seeds; the seeds still cover bootstrap and
+        # an unavailable catalog.
+        local -a registered unique=()
+        local -A seen=()
+        read -r -d '' -a registered < "$CONSUL_FE_FILE" || true
+        # Seeds are usually registered too; query each FE once per round.
+        for candidate in "${registered[@]}" "${candidates[@]}"; do
+            [[ -z ${seen[$candidate]:-} ]] || continue
+            seen[$candidate]=1
+            unique+=("$candidate")
+        done
+        candidates=("${unique[@]}")
+    fi
     for candidate in "${candidates[@]}"; do validate_ip "$candidate"; done
     prepare_config
 
