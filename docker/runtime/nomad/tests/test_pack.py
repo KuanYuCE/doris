@@ -33,6 +33,10 @@ class PackTest(unittest.TestCase):
                 check=True, capture_output=True, text=True, cwd="/tmp",
             )
             rendered = Path(tmp) / "doris/doris.nomad"
+            # Server-side rules (for example, no empty templates) are checked
+            # locally even without a reachable agent.
+            subprocess.run(["nomad", "job", "validate", str(rendered)],
+                           check=True, capture_output=True, text=True)
             result = subprocess.run(
                 ["nomad", "job", "run", "-output", str(rendered)],
                 check=True, capture_output=True, text=True,
@@ -82,6 +86,15 @@ class PackTest(unittest.TestCase):
                 prepare = next(t for t in group["Tasks"] if t["Name"] == "prepare")
                 config = next(t for t in prepare["Templates"] if t["DestPath"] == "local/fe-overrides.conf")
                 self.assertEqual(config["EmbeddedTmpl"], "sys_log_level = WARN\n")
+
+    def test_empty_component_config_is_omitted(self):
+        job = self.render(["--var", "fe_config=", "--var", "be_config="])
+        for group in job["TaskGroups"]:
+            prepare = next(t for t in group["Tasks"] if t["Name"] == "prepare")
+            self.assertNotIn("CONFIG_OVERRIDES_FILE", prepare["Env"])
+            for template in prepare["Templates"]:
+                self.assertNotIn("overrides", template["DestPath"])
+                self.assertTrue(template["EmbeddedTmpl"])
 
     def test_vault_credentials_are_runtime_templates(self):
         job = self.render()

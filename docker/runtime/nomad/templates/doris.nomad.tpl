@@ -42,6 +42,7 @@ job [[ var "job_name" . | quote ]] {
 
   [[ range $kind, $nodes := dict "fe" $feNodes "be" $beNodes ]]
   [[ range $node := $nodes ]]
+  [[ $overrides := var (printf "%s_config" $kind) $root ]]
   group [[ printf "%s-%s" $kind $node.hostname | quote ]] {
     count = 1
     constraint {
@@ -110,7 +111,10 @@ job [[ var "job_name" . | quote ]] {
         BOOTSTRAP_IP          = [[ $bootstrap | quote ]]
         FE_CANDIDATES         = [[ join " " $seeds | quote ]]
         DISCOVERY_TIMEOUT     = [[ var "discovery_timeout" $root | toString | quote ]]
+        [[ if $overrides ]]
+        # Nomad rejects an empty template, so an empty fragment is omitted.
         CONFIG_OVERRIDES_FILE = [[ printf "/local/%s-overrides.conf" $kind | quote ]]
+        [[ end ]]
         [[ if eq $provider "consul" ]]
         CONSUL_FE_FILE = "/local/consul-fe"
         [[ end ]]
@@ -140,9 +144,9 @@ job [[ var "job_name" . | quote ]] {
 EOF
       }
       [[ end ]]
-      [[ if eq $kind "fe" ]]
+      [[ if and $overrides (eq $kind "fe") ]]
       [[ template "fe-config" $root ]]
-      [[ else ]]
+      [[ else if $overrides ]]
       [[ template "be-config" $root ]]
       [[ end ]]
       [[ template "credentials" (dict "root" $root "kind" $kind "prepare" true) ]]
