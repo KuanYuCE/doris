@@ -48,7 +48,8 @@ class PrestartTest(unittest.TestCase):
         self.data = self.base / "alloc"
         self.data.mkdir()
         (self.base / "my.cnf").write_text('[client]\npassword="test-only"\n')
-        (self.base / "hash").write_text("*" + "A" * 40)
+        # Rendered from Vault by the prepare task's secrets/root-password template.
+        (self.base / "root-password").write_bytes(b"root@123")
         self.bin = self.base / "bin"
         self.bin.mkdir()
         # Only the external database is replaced. Run the real shell program,
@@ -82,7 +83,7 @@ class PrestartTest(unittest.TestCase):
             DORIS_HOME=str(self.base / "image"),
             ALLOC_DATA=str(self.data),
             DORIS_MY_CNF=str(self.base / "my.cnf"),
-            ROOT_PASSWORD_HASH_FILE=str(self.base / "hash"),
+            ROOT_PASSWORD_FILE=str(self.base / "root-password"),
             NODE_KIND="fe",
             NODE_IP="10.0.0.3",
             BOOTSTRAP_IP="10.0.0.1",
@@ -117,7 +118,9 @@ class PrestartTest(unittest.TestCase):
         self.assertEqual(set(self.queries()), {"SHOW FRONTENDS"})
         conf = (self.data / "conf/fe.conf").read_text()
         self.assertIn("custom_option = preserved", conf)
-        self.assertIn("initial_root_password = *" + "A" * 40, conf)
+        # MySQL PASSWORD("root@123"), as documented by Doris.
+        self.assertIn("initial_root_password = *A00C34073A26B40AB4307650BFB9309D6BFA6999", conf)
+        self.assertNotIn("root@123", result.stdout + result.stderr + conf)
 
     def test_existing_fe_starts_without_reachable_peers(self):
         image = self.meta / "image"
@@ -129,16 +132,12 @@ class PrestartTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.endpoint(), "10.0.0.3")
 
-    def test_vault_password_generates_initial_hash(self):
-        password = self.base / "root-password"
-        password.write_bytes(b"root@123")
-        self.env["ROOT_PASSWORD_FILE"] = str(password)
-        (self.base / "hash").unlink()
+    def test_empty_vault_password_fails(self):
+        (self.base / "root-password").write_bytes(b"")
         result = self.run_prestart()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("initial_root_password = *A00C34073A26B40AB4307650BFB9309D6BFA6999",
-                      (self.data / "conf/fe.conf").read_text())
-        self.assertNotIn("root@123", result.stdout + result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("empty", result.stderr)
+        self.assertFalse((self.data / "endpoint.env").exists())
 
     def test_component_config_is_appended_to_image_defaults(self):
         overrides = self.base / "overrides.conf"

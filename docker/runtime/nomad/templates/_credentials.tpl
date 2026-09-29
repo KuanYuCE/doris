@@ -17,17 +17,12 @@
 
 [[ define "credentials" ]]
 [[ $root := .root ]]
-[[ $source := var "credential_source" $root ]]
-[[ if eq $source "vault" ]]
 vault {
   role         = [[ var "vault_role" $root | quote ]]
   env          = false
   disable_file = true
   change_mode  = "noop"
 }
-[[ else if ne $source "nomad" ]]
-[[ fail "credential_source must be vault or nomad" ]]
-[[ end ]]
 template {
   destination          = "secrets/my.cnf"
   perms                = "0600"
@@ -36,18 +31,13 @@ template {
   error_on_missing_key = true
   once                 = true
   data                 = <<EOF
-[[ if eq $source "vault" ]]
 {{ with secret [[ var "vault_secret_path" $root | quote ]] }}
 [client]
 password="{{ index .Data.data [[ var "vault_password_key" $root | quote ]] | replaceAll "\\" "\\\\" | replaceAll "\"" "\\\"" | replaceAll "\n" "\\n" | replaceAll "\r" "\\r" | replaceAll "\t" "\\t" }}"
 {{ end }}
-[[ else ]]
-{{ with nomadVar "nomad/jobs/[[ var "job_name" $root ]]" }}{{ .my_cnf }}{{ end }}
-[[ end ]]
 EOF
 }
 [[ if and .prepare (eq .kind "fe") ]]
-[[ if eq $source "vault" ]]
 template {
   destination          = "secrets/root-password"
   perms                = "0600"
@@ -60,18 +50,5 @@ template {
 {{- with secret [[ var "vault_secret_path" $root | quote ]] -}}{{ index .Data.data [[ var "vault_password_key" $root | quote ]] }}{{- end -}}
 EOF
 }
-[[ else ]]
-template {
-  destination          = "secrets/root-password-hash"
-  perms                = "0600"
-  uid                  = 0
-  gid                  = 0
-  error_on_missing_key = true
-  once                 = true
-  data                 = <<EOF
-{{ with nomadVar "nomad/jobs/[[ var "job_name" $root ]]" }}{{ .root_password_hash }}{{ end }}
-EOF
-}
-[[ end ]]
 [[ end ]]
 [[ end ]]

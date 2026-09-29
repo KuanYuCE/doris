@@ -3,8 +3,8 @@
 ## Agreed scope
 
 One pack deploys fixed-identity FE and BE groups. Preserve the main containers'
-upstream Docker entrypoints. Supply MySQL credentials with a Vault KV v2 template
-(optionally Nomad Variables), initialize the root password with `initial_root_password`, and perform
+upstream Docker entrypoints. Supply MySQL credentials with a Vault KV v2 template,
+initialize the root password with `initial_root_password`, and perform
 endpoint discovery in an ephemeral prestart task.
 
 ## Implementation
@@ -87,3 +87,11 @@ environment for a standalone deployment example.
 - Prestart prepends healthy FEs from a once-rendered Consul template to the
   static seeds. Seeds remain required for bootstrap and catalog outages.
 - The nomad provider keeps TCP and HTTP checks only.
+
+## Vault-only credentials
+
+- Remove the Nomad Variables credential mode (`credential_source`,
+  `scripts/credentials.py`). Vault KV v2 is the only source: the task templates
+  render the MySQL option file and, for FE prestart, the raw password from
+  which `initial_root_password` is derived. The plaintext password must remain
+  available to the mysql clients in the entrypoints, prestart and ready.sh.

@@ -118,9 +118,6 @@ job [[ var "job_name" . | quote ]] {
         [[ if eq $provider "consul" ]]
         CONSUL_FE_FILE = "/local/consul-fe"
         [[ end ]]
-        [[ if and (eq $kind "fe") (eq (var "credential_source" $root) "vault") ]]
-        ROOT_PASSWORD_FILE = "/secrets/root-password"
-        [[ end ]]
       }
       volume_mount {
         volume      = "data"

@@ -11,7 +11,6 @@
 - `templates/_fe-config.tpl`、`templates/_be-config.tpl`：獨立的 FE／BE 設定片段 templates。
 - `scripts/prestart.sh`：在對應的 Doris image 內準備設定、探索 master、把關 bootstrap。
 - `scripts/ready.sh`：Consul script check，在主容器內以已認證 SQL 判斷節點是否可用。
-- `scripts/credentials.py`：僅供選用的 `credential_source="nomad"` 模式使用，不是 Vault 模式的必要步驟。
 - `examples/cluster.hcl`：3 FE + 3 BE 的 pack 變數。
 - `examples/client.hcl`：每台 Nomad client 所需的持久化 host volumes。
 
@@ -121,7 +120,6 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
    `doris-secret/bootstrap`，欄位為 `password`。pack 變數如下：
 
    ```hcl
-   credential_source  = "vault"
    vault_role         = "doris"
    vault_secret_path  = "kv-data/data/doris-secret/bootstrap"
    vault_password_key = "password"
@@ -331,14 +329,10 @@ FE group；確認 SQL 健康後再更新下一台。`max_parallel=1` 是 **每�
 - 固定 client 保護節點身分與本地磁碟對應，但 client 永久故障不會自動遷移資料。
 - 此範例不配置 SQL TLS、網路防火牆或外部負載平衡器；依既有內網部署規範設定。
 
-若不用 Vault，可改成 `credential_source="nomad"`，再執行：
-
-```bash
-python3 docker/runtime/nomad/scripts/credentials.py --job doris --namespace default
-```
-
-此備用模式會透過 stdin 建立 `nomad/jobs/doris` 的 `my_cnf` 與 `root_password_hash`
-items，使用 CAS=0 拒絕覆寫既有 variable。使用 Vault 時不需要執行這個工具。
+Vault KV v2 是唯一的密碼來源。Vault secret 必須保存**明文**密碼：`initial_root_password`
+只決定首次 bootstrap 的 root 密碼，之後原入口、prestart 與 `ready.sh` 的 mysql
+client 都以 `my.cnf` 中的明文密碼登入。不要另外在 `fe_config` 設定
+`initial_root_password`；它屬於 pack 管理的設定，prestart 會拒絕。
 
 ## 驗證
 

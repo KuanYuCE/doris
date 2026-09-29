@@ -22,8 +22,7 @@ umask 077
 DORIS_HOME=${DORIS_HOME:-/opt/apache-doris}
 ALLOC_DATA=${ALLOC_DATA:-/alloc/data}
 DORIS_MY_CNF=${DORIS_MY_CNF:-/secrets/my.cnf}
-ROOT_PASSWORD_HASH_FILE=${ROOT_PASSWORD_HASH_FILE:-/secrets/root-password-hash}
-ROOT_PASSWORD_FILE=${ROOT_PASSWORD_FILE:-}
+ROOT_PASSWORD_FILE=${ROOT_PASSWORD_FILE:-/secrets/root-password}
 CONFIG_OVERRIDES_FILE=${CONFIG_OVERRIDES_FILE:-}
 CONSUL_FE_FILE=${CONSUL_FE_FILE:-}
 DISCOVERY_TIMEOUT=${DISCOVERY_TIMEOUT:-300}
@@ -97,15 +96,12 @@ prepare_config() {
     # scripts append a /24 priority_networks on new nodes, so use the same subnet.
     printf '\npriority_networks = %s.0/24\n' "${NODE_IP%.*}" >> "$conf"
     if [[ $NODE_KIND == fe ]]; then
+        # MySQL PASSWORD() format of the exact Vault bytes:
+        # '*' + uppercase hex(SHA1(SHA1(password))).
+        [[ -s $ROOT_PASSWORD_FILE ]] || fail "Vault root password is empty"
         local hash
-        if [[ -n $ROOT_PASSWORD_FILE ]]; then
-            [[ -s $ROOT_PASSWORD_FILE ]] || fail "Vault root password is empty"
-            hash=$(openssl dgst -sha1 -binary "$ROOT_PASSWORD_FILE" |
-                openssl dgst -sha1 -r | awk '{print "*" toupper($1)}')
-        else
-            hash=$(< "$ROOT_PASSWORD_HASH_FILE")
-        fi
-        [[ $hash =~ ^\*[A-F0-9]{40}$ ]] || fail "Invalid initial root password hash"
+        hash=$(openssl dgst -sha1 -binary "$ROOT_PASSWORD_FILE" |
+            openssl dgst -sha1 -r | awk '{print "*" toupper($1)}')
         printf 'initial_root_password = %s\n' "$hash" >> "$conf"
         printf 'meta_dir = %s/fe/doris-meta\n' "$DORIS_HOME" >> "$conf"
     else

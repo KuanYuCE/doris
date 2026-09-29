@@ -99,12 +99,6 @@ variable "service_provider" {
   description = "Register FE/BE services with consul (default; requires Consul on every client) or nomad (built-in)."
 }
 
-variable "credential_source" {
-  type        = string
-  default     = "vault"
-  description = "Use vault (KV v2) or nomad (the original Nomad Variables helper)."
-}
-
 variable "vault_secret_path" {
   type        = string
   default     = "kv-data/data/doris-secret/bootstrap"

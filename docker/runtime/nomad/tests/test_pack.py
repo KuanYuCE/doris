@@ -105,6 +105,9 @@ class PackTest(unittest.TestCase):
                 templates = {t["DestPath"]: t for t in task["Templates"]}
                 self.assertIn('secret "kv-data/data/doris-secret/bootstrap"',
                               templates["secrets/my.cnf"]["EmbeddedTmpl"])
+                # Vault is the only credential source.
+                for template in templates.values():
+                    self.assertNotIn("nomadVar", template["EmbeddedTmpl"])
                 if task["Name"] == "prepare" and group["Name"].startswith("fe-"):
                     self.assertIn("secrets/root-password", templates)
                 else:
@@ -155,19 +158,6 @@ class PackTest(unittest.TestCase):
     def test_unknown_service_provider_is_rejected(self):
         with self.assertRaises(subprocess.CalledProcessError):
             self.render(["--var", "service_provider=dns"])
-
-    def test_nomad_variable_backend_remains_available(self):
-        job = self.render(["--var", "credential_source=nomad"])
-        for group in job["TaskGroups"]:
-            for task in group["Tasks"]:
-                self.assertIsNone(task["Vault"])
-                templates = {t["DestPath"]: t for t in task["Templates"]}
-                self.assertIn('nomadVar "nomad/jobs/doris"',
-                              templates["secrets/my.cnf"]["EmbeddedTmpl"])
-                self.assertNotIn("secrets/root-password", templates)
-                if task["Name"] == "prepare" and group["Name"].startswith("fe-"):
-                    self.assertIn("secrets/root-password-hash", templates)
-
 
 if __name__ == "__main__":
     unittest.main()

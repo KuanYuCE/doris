@@ -23,7 +23,6 @@ datacenters = ["dc1"]
 # when the clients do not run a Consul agent.
 service_provider = "consul"
 
-credential_source  = "vault"
 vault_role         = "doris"
 vault_secret_path  = "kv-data/data/doris-secret/bootstrap"
 vault_password_key = "password"
