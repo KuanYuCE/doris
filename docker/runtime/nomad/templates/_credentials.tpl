@@ -31,10 +31,12 @@ template {
   error_on_missing_key = true
   once                 = true
   data                 = <<EOF
-{{ with secret [[ var "vault_secret_path" $root | quote ]] }}
+{{- with secret [[ var "vault_secret_path" $root | quote ]] }}
+{{- with index .Data.data [[ var "vault_password_key" $root | quote ]] }}
 [client]
-password="{{ index .Data.data [[ var "vault_password_key" $root | quote ]] | replaceAll "\\" "\\\\" | replaceAll "\"" "\\\"" | replaceAll "\n" "\\n" | replaceAll "\r" "\\r" | replaceAll "\t" "\\t" }}"
-{{ end }}
+password="{{ . | replaceAll "\\" "\\\\" | replaceAll "\"" "\\\"" | replaceAll "\n" "\\n" | replaceAll "\r" "\\r" | replaceAll "\t" "\\t" }}"
+{{ end -}}
+{{- end }}
 EOF
 }
 [[ if and .prepare (eq .kind "fe") ]]
@@ -47,7 +49,11 @@ template {
   once                 = true
   # Whitespace trimming preserves the exact password bytes for hashing.
   data = <<EOF
-{{- with secret [[ var "vault_secret_path" $root | quote ]] -}}{{ index .Data.data [[ var "vault_password_key" $root | quote ]] }}{{- end -}}
+{{- with secret [[ var "vault_secret_path" $root | quote ]] -}}
+{{- with index .Data.data [[ var "vault_password_key" $root | quote ]] -}}
+{{ . }}
+{{- end -}}
+{{- end -}}
 EOF
 }
 [[ end ]]
