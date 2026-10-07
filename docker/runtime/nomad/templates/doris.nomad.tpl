@@ -32,22 +32,48 @@
 [[ if not (has $bootstrap $ips) ]][[ fail "bootstrap_fe must occur in fe_nodes" ]][[ end ]]
 [[ $seeds := var "discovery_fe_ips" . ]]
 [[ if not $seeds ]][[ fail "discovery_fe_ips must not be empty" ]][[ end ]]
-[[ $provider := var "service_provider" . ]]
-[[ if not (has $provider (list "nomad" "consul")) ]][[ fail "service_provider must be nomad or consul" ]][[ end ]]
+
 
 job [[ var "job_name" . | quote ]] {
   namespace   = [[ var "namespace" . | quote ]]
   datacenters = [[ var "datacenters" . | toJson ]]
   type        = "service"
+  node_pool   = [[ var "node_pool" . | quote ]]
+
+  spread {
+    attribute = "${meta.dc}"
+  }
+
+  spread {
+    attribute = "${meta.rack}"
+  }
+  constraint {
+    attribute = "${meta.service}"
+    value     = [[ var "meta_service" . | quote ]]
+  }
+  [[- if ne (var "meta_pool" .) "" ]]
+  constraint {
+    attribute = "${meta.pool}"
+    value     = [[ var "meta_pool" . | quote ]]
+  }
+  [[- end ]]
+
+
+
 
   [[ range $kind, $nodes := dict "fe" $feNodes "be" $beNodes ]]
-  [[ range $node := $nodes ]]
+  [[ range $idx, $node := $nodes ]]
   [[ $overrides := var (printf "%s_config" $kind) $root ]]
   group [[ printf "%s-%s" $kind $node.hostname | quote ]] {
     count = 1
     constraint {
       attribute = "${node.unique.name}"
       value     = [[ $node.hostname | quote ]]
+    }
+    constraint {
+      attribute = "${meta.doris_blocks}"
+      operator  = "set_contains"
+      value     = [[ $kind | quote ]]
     }
 
     # A new allocation reruns prestart. A main-task-only restart would reuse
@@ -70,11 +96,27 @@ job [[ var "job_name" . | quote ]] {
       auto_revert       = false
     }
 
-    volume "data" {
+    [[ if eq $kind "fe" ]]
+    volume "meta" {
       type      = "host"
-      source    = [[ $node.volume | quote ]]
+      source    = "[[ template "blockVolumeName" (list "fe" $node.block_index 0) ]]"
       read_only = false
     }
+    volume "log" {
+      type      = "host"
+      source    = "[[ template "blockVolumeName" (list "fe" $node.block_index 1) ]]"
+      read_only = false
+    }
+    [[ else ]]
+    [[ range $d := until (var "be_disks_per_block" $root) ]]
+    volume "storage[[ add1 $d ]]" {
+      type      = "host"
+      source    = "[[ template "blockVolumeName" (list "be" $node.block_index $d) ]]"
+      read_only = false
+    }
+    [[ end ]]
+    [[ end ]]
+
     network {
       mode = "host"
       [[ if eq $kind "fe" ]]
@@ -100,7 +142,8 @@ job [[ var "job_name" . | quote ]] {
       driver = "docker"
       user   = "0"
       config {
-        image        = [[ $node.image | quote ]]
+        
+ image        = "[[ ternary (var "fe_image_repo" $root) (var "be_image_repo" $root) (eq $kind "fe") ]]:[[ $kind ]]-[[ template "versionOverride" (list (var (printf "%s_version_overrides" $kind) $root) (printf "%v" $idx) (var "doris_version" $root)) ]]" 
         network_mode = "host"
         # Only this short-lived helper overrides the image entrypoint.
         entrypoint = ["/bin/bash", "/local/prestart.sh"]
@@ -115,15 +158,16 @@ job [[ var "job_name" . | quote ]] {
         # Nomad rejects an empty template, so an empty fragment is omitted.
         CONFIG_OVERRIDES_FILE = [[ printf "/local/%s-overrides.conf" $kind | quote ]]
         [[ end ]]
-        [[ if eq $provider "consul" ]]
         CONSUL_FE_FILE = "/local/consul-fe"
+        [[ if eq $kind "be" ]]
+        BE_DISK_COUNT = [[ var "be_disks_per_block" $root | toString | quote ]]
         [[ end ]]
       }
       [[ if eq $kind "fe" ]]
       # Prestart inspects ROLE/VERSION and consumes the bootstrap permit. It
       # never touches BE storage; init_be.sh checks that in the main task.
       volume_mount {
-        volume      = "data"
+        volume      = "meta"
         destination = "/opt/apache-doris/fe/doris-meta"
       }
       [[ end ]]
@@ -133,7 +177,7 @@ job [[ var "job_name" . | quote ]] {
         once        = true
         data        = [[ fileContents (printf "%s/scripts/prestart.sh" $packPath) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
       }
-      [[ if eq $provider "consul" ]]
+
       # Healthy (SQL-ready) FEs at task start. An empty list is valid: the
       # static seeds still cover bootstrap and a new catalog.
       template {
@@ -144,7 +188,7 @@ job [[ var "job_name" . | quote ]] {
 {{ end }}
 EOF
       }
-      [[ end ]]
+
       [[ if and $overrides (eq $kind "fe") ]]
       [[ template "fe-config" $root ]]
       [[ else if $overrides ]]
@@ -185,22 +229,39 @@ EOF
         BE_PORT = "9050"
         [[ end ]]
       }
+      [[ if eq $kind "fe" ]]
       volume_mount {
-        volume      = "data"
-        destination = [[ printf "/opt/apache-doris/%s/%s" $kind (ternary "doris-meta" "storage" (eq $kind "fe")) | quote ]]
+        volume      = "meta"
+        destination = "/opt/apache-doris/fe/doris-meta"
       }
+      volume_mount {
+        volume      = "log"
+        destination = "/opt/apache-doris/fe/log"
+      }
+      [[ else ]]
+      [[ range $d := until (var "be_disks_per_block" $root) ]]
+
+
+      volume_mount {
+         volume      = "storage[[ add1 $d ]]"
+        destination = "/opt/apache-doris/be/storage/data[[ add1 $d ]]"
+      }
+
+      [[ end ]]
+      [[ end ]]
       [[ template "credentials" (dict "root" $root "kind" $kind "prepare" false) ]]
       [[ $port := ternary "query" "heartbeat" (eq $kind "fe") ]]
       [[ if eq $provider "consul" ]]
       template {
-        destination = "local/ready.sh"
+     
+destination = "local/consul_ready.sh"
         perms       = "0644"
         once        = true
-        data        = [[ fileContents (printf "%s/scripts/ready.sh" $packPath) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
+     data        = [[ fileContents (printf "%s/scripts/consul_ready.sh" $packPath) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
       }
       [[ end ]]
       service {
-        provider = [[ $provider | quote ]]
+       provider = "consul"
         name     = [[ printf "%s-%s" (var "job_name" $root) $kind | quote ]]
         port     = [[ $port | quote ]]
         address  = [[ $node.ip | quote ]]
@@ -220,7 +281,7 @@ EOF
           name     = "sql-ready"
           type     = "script"
           command  = "/bin/bash"
-          args     = [[ concat (list "/local/ready.sh" $kind $node.ip) (ternary (list) $seeds (eq $kind "fe")) | toJson ]]
+          args     = [[ concat (list "/local/consul_ready.sh" $kind $node.ip) (ternary (list) $seeds (eq $kind "fe")) | toJson ]]
           interval = "15s"
           timeout  = "10s"
         }
@@ -228,7 +289,43 @@ EOF
       }
       [[ if eq $kind "fe" ]]
       service {
-        provider = [[ $provider | quote ]]
+        provider = "consul"
+        name     = [[ printf "%s-fe-editlog" (var "job_name" $root) | quote ]]
+        port     = "edit_log"
+        address  = [[ $node.ip | quote ]]
+        tags     = ["editlog", [[ printf "fe-id-%v" $idx | quote ]]]
+        meta {
+          node = [[ $node.hostname | quote ]]
+        }
+        check {
+          type     = "tcp"
+          port     = "edit_log"
+          interval = "10s"
+          timeout  = "3s"
+       }
+      }
+      [[ end ]]
+      service {
+        provider = "consul"
+        name     = [[ printf "%s-%s-flight" (var "job_name" $root) $kind | quote ]]
+        port     = "arrow"
+        address  = [[ $node.ip | quote ]]
+        tags     = ["flight", "arrow-flight-sql", [[ printf "%s-id-%v" $kind $idx | quote ]]]
+        meta {
+        node = [[ $node.hostname | quote ]]
+        }
+        check {
+          type     = "tcp"
+          port     = "arrow"
+          interval = "10s"
+          timeout  = "3s"
+        }
+      }
+      [[ if eq $kind "fe" ]]
+      service {
+        provider = "consul"
+
+
         name     = [[ printf "%s-fe-http" (var "job_name" $root) | quote ]]
         port     = "http"
         address  = [[ $node.ip | quote ]]
