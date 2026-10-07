@@ -12,7 +12,10 @@
 - `templates/_credentials.tpl`：透過 Vault KV v2 與 Nomad HCL `template` blocks 產生權限 `0600` 的 `.my.cnf`。
 - `templates/_fe-config.tpl`、`templates/_be-config.tpl`：獨立的 FE／BE 設定片段 templates。
 - `scripts/prestart.sh`：在對應的 Doris image 內準備設定、探索 master、把關 bootstrap。
-- `scripts/ready.sh`：Consul script check，在主容器內以已認證 SQL 判斷節點是否可用。
+- `scripts/consul_ready.sh`：Consul script check，在主容器內以已認證 SQL 判斷節點是否可用。
+- `scripts/wipe-volumes.sh`：在 bastion 執行，**清空 job 所有 host volume 的資料**，用於重建叢集（見「重建叢集」）。
+- `scripts/ops-common.sh`：`wipe-volumes.sh` 使用的 Nomad 查詢、render 與 SSH 函式；`bootstrap-permit.sh` 內含相同函式的副本以便獨立執行，測試會檢查兩者一致。
+- `scripts/bootstrap-permit.sh`：在 bastion 執行、可獨立執行的操作人員工具。必須在 `nomad-pack run` 前執行：從 var-file 找出 bootstrap FE，經 Nomad node API 查出 meta volume 路徑，並經 SSH 建立一次性授權檔。
 - `examples/cluster.hcl`：pack 的 **var-file** 範例（3 FE + 3 BE），以 `nomad-pack -f` 傳入。
 - `examples/client.hcl`：Nomad client agent 設定（持久化 host volumes），**不是** var-file。
 
@@ -32,10 +35,12 @@ doris task
        └─ ASSIGN 模式：新節點由 init_fe.sh / init_be.sh 自行
           ALTER SYSTEM ADD FOLLOWER / BACKEND 後啟動
                 ↓
-Consul services（預設 service_provider = "consul"）
+Consul services
   ├─ <job>-fe：9030，TCP + sql-ready script check
   ├─ <job>-fe-http：8030，GET /api/health
-  └─ <job>-be：9050，TCP + sql-ready script check
+  ├─ <job>-fe-editlog：9010，TCP
+  ├─ <job>-be：9050，TCP + sql-ready script check
+  └─ <job>-fe-flight／<job>-be-flight：8070／8050（Arrow Flight SQL），TCP
 ```
 
 ### prestart 與原入口的分工
@@ -44,7 +49,7 @@ Consul services（預設 service_provider = "consul"）
 
 | 工作 | 負責者 | 原因 |
 | --- | --- | --- |
-| `SHOW FRONTENDS`/`SHOW BACKENDS` 檢查、`ALTER SYSTEM ADD FOLLOWER/BACKEND` | 原入口 | `init_fe.sh` 在 metadata 為空、`init_be.sh` 在 `storage/data` 不存在時執行 |
+| `SHOW FRONTENDS`/`SHOW BACKENDS` 檢查、`ALTER SYSTEM ADD FOLLOWER/BACKEND` | 原入口 | `init_fe.sh` 在 metadata 為空時執行；`init_be.sh` 只看 `storage/data`，多磁碟配置下資料在 `storage/data<N>/`，所以每次啟動都會先查 `SHOW BACKENDS`，已註冊就略過 |
 | 找出現任 master | prestart | ASSIGN 模式需要固定的 `FE_MASTER_IP`，原入口不會探索；master 會漂移 |
 | 決定是否 bootstrap 新叢集 | prestart | 原入口看到 `FE_MASTER_IP == FE_CURRENT_IP` 就以新 master 啟動，沒有防止第二個叢集的機制 |
 | 既有 FE 不等 quorum 直接放行 | prestart | 將 `FE_MASTER_IP` 設為自己，原入口直接啟動既有 metadata |
@@ -95,11 +100,16 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
 - image 內有 Bash、mysql client、OpenSSL、GNU coreutils（含 `timeout`）及 awk。
 - 使用 IPv4、host network、標準 Doris ports；每台 client 至多一個 FE、一個 BE。
 - hostname 是 **Nomad client node name**，不是 Doris FQDN；Doris membership 使用 `ip`。
-- IP 必須確實屬於該 host，且所在 `/24` 只能對應一個適用的介面位址。
-  原有 entrypoint 會自行附加 `/24` 的 `priority_networks`，本 pack 不修改它。
+- IP 必須確實屬於該 host。同一台 host 可用 IP alias 讓 FE 與 BE 各用一個位址：
+  prestart 把 `priority_networks = <ip>/32` 寫進 `fe_custom.conf`／`be_custom.conf`。
+  原有 entrypoint 仍會在 `fe.conf`／`be.conf` 附加 `/24`，但 Doris 在讀完
+  `<kind>.conf` 後才讀 `<kind>_custom.conf` 並以其覆蓋，所以生效的是 `/32`。
 - Nomad client 已配置持久化 host volumes；資料不能放在 ephemeral allocation 目錄。
-- 預設使用 Consul：每台 client 需有 Consul agent，Nomad 已完成 Consul 整合；
-  沒有 Consul 時設 `service_provider = "nomad"`。
+- 需要 Consul：每台 client 需有 Consul agent，Nomad 已完成 Consul 整合（見「Consul 前提」）。
+- Nomad client 以 systemd 執行時，不可啟用 `PrivateTmp`、`PrivateDevices`、
+  `ProtectHome`、`ProtectSystem` 等會建立 mount namespace 的選項，請沿用官方 unit。
+  Nomad 在 task 的 `secrets/` 掛載的 tmpfs 只存在 nomad 的 namespace，dockerd 看不到，
+  container 內的 `/secrets/*` 會是空的；`MountFlags=shared` 也無法恢復傳播。
 - 範例 FE memory 為 16 GiB，以容納 image 常見的 8 GiB JVM heap；請對照實際 image
   與主機容量配置資源。FE 與 BE 同機時，兩者 reservation 必須都能滿足。
 - 依 Doris 正式部署要求預先設定主機，例如 BE 的 `vm.max_map_count`、磁碟、時鐘同步等。
@@ -112,10 +122,14 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
 
 ## 一次性準備
 
-1. 在每台指定 client 建立並掛載 `/srv/doris/fe-meta`、`/srv/doris/be-storage`。
-   將 `examples/client.hcl` 的 host volumes 合併到 Nomad client 設定。這些路徑必須位於
-   正確的持久磁碟，不能在磁碟缺失時退回空目錄。
-2. 複製 `examples/cluster.hcl` 到你自己的設定檔，填入 client name、IP、image、volume。
+1. 在每台指定 client 準備 host volumes，名稱固定為 `doris-<fe|be>-b<block_index>-d<disk>`
+   （`templates/_helpers.tpl` 的 `blockVolumeName`）：FE 使用 `d0`（meta）與 `d1`（log），
+   BE 使用 `d0` 到 `d<be_disks_per_block - 1>`。可由 dynamic host volume plugin 建立，
+   或參考 `examples/client.hcl` 以 static host volume 設定；同一檔案也列出 job
+   constraints 需要的 `node_pool` 與 client `meta`。這些路徑必須位於正確的持久磁碟，
+   不能在磁碟缺失時退回空目錄。
+2. 複製 `examples/cluster.hcl` 到你自己的設定檔，填入 client name、IP、`block_index`，
+   以及 `fe_image_repo`／`be_image_repo`／`doris_version`。
    `bootstrap_fe` 是首次建立叢集的唯一 FE，不代表永久 master。
    `discovery_fe_ips` 是穩定的 discovery seeds，建議為最初三台 FE。
 3. 使用既有的 Vault KV v2 secret：mount 為 `kv-data`，secret 路徑為
@@ -128,6 +142,8 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
    ```
 
    `vault_secret_path` 是 **API 路徑**，所以 KV v2 的 mount 後需要 `/data/`。
+   `vault_password_key` 只能使用英數字與底線（`[A-Za-z_][A-Za-z0-9_]*`），render 時檢查。
+   secret 中缺少這個欄位時，template 會直接失敗，不會產生空密碼檔。
    Nomad server/client 須已完成 Vault workload identity 整合（包含 default identity），
    `vault_role` 請填入你實際使用的 Vault JWT auth role。角色所附 policy 至少需要：
 
@@ -151,12 +167,46 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
    Vault token 不注入容器的環境變數或檔案；Nomad 管理 token 與 template 渲染。
    這是固定 KV root 密碼的流程，不是 Vault database engine 的動態帳號流程。
 
-4. **僅限確定為全新叢集**：在 `bootstrap_fe` 對應的 host 上，於空白 FE 資料卷建立
-   一次性授權檔：
+4. **僅限確定為全新叢集**：在 `nomad-pack run` **之前**，於 bastion 上建立
+   bootstrap FE 的一次性授權檔（放在 `doris-fe-b<block_index>-d0` 資料卷）。
+   `scripts/bootstrap-permit.sh` **接受與 `nomad-pack run` 相同的參數**（最後一個是
+   pack 名稱或路徑），以本機 `nomad-pack render` 讀出 bootstrap FE，不需要 job 已提交；
+   再從 Nomad node API 查出該 host volume 的實際路徑，經 SSH 建立。請在與
+   `nomad-pack run` 相同的目錄、以相同的參數與順序執行（nomad-pack 疊加多個 var-file
+   時的結果與路徑寫法有關，這樣才能保證兩者一致）：
 
    ```bash
-   sudo touch /srv/doris/fe-meta/.bootstrap-approved
+   export NOMAD_TOKEN=...   # token 只接受環境變數，避免出現在 ps 與 shell history
+   ARGS=(--registry=doris_packs --ref=pack-template \
+         --address=https://nomad.example:4646 --ca-cert=/etc/nomad.d/ca.pem \
+         --namespace=doris --var-file=/path/to/cluster.hcl doris)
+
+   scripts/bootstrap-permit.sh --dry-run "${ARGS[@]}"   # 確認節點、volume、路徑與 SSH 目標
+   scripts/bootstrap-permit.sh "${ARGS[@]}"             # 經 SSH 建立授權檔
+   nomad-pack run "${ARGS[@]}"                          # 部署，之後不需要再下任何指令
    ```
+
+   參數分流：`--registry`、`--ref`、`--var-file`（`-f=`）、`--var` 依原順序交給
+   `nomad-pack render`；`--address`、`--ca-cert`、`--client-cert`、`--client-key`、
+   `--tls-server-name`、`--region`、`--namespace` 交給 nomad CLI（`-flag=` 與
+   `--flag=` 皆可，一律寫成 `=` 形式），也可改用對應的 `NOMAD_*` 環境變數。
+   `--token` 會被拒絕。沒有給 pack 時，render 腳本所在的 pack（`scripts/..`）。
+
+   **必須在 `nomad-pack run` 之前執行完成。** 腳本會在 job 可能所在的每個 namespace
+   （render 出的 `namespace`、`--namespace`、`NOMAD_NAMESPACE`）檢查 job：任一處已註冊
+   且仍在執行（未 stop，或仍有 running／pending allocations）就拒絕，請先 `nomad job stop`；
+   都不存在或已 stop（例如剛用 `wipe-volumes.sh` 清空）才會執行。
+
+   腳本可以**獨立執行**，不依賴 pack 內其他 script，只需要 `nomad`、`nomad-pack`、`ssh`；
+   從 registry 部署時，bastion 上已有的 `nomad-pack registry` 設定就足夠。
+
+   建立授權檔時預設執行 `ssh <節點在 Nomad 回報的 IP>`，可用 `--ssh-host=[user@]host`
+   覆寫；金鑰、ProxyJump、port 等設定請寫在 bastion 的 `~/.ssh/config`。遠端以
+   `sudo -n` 執行，該帳號需要免密碼 sudo。遠端主機必須擁有該節點的 IP，且資料卷
+   存在、沒有 `image`、`bdb`、`.bootstrap-consumed`，才會建立檔案；`--ssh-host`
+   指到錯的機器時會被拒絕。若忘了先建立授權檔就部署，bootstrap FE 會在
+   `discovery_timeout` 後失敗，prepare task 的 log 會印出應放置的 volume 與節點，
+   並提示先 stop job、執行本腳本、再重新 `nomad-pack run`。
 
    其他 FE 不建立此檔。prestart 先嘗試發現既有 master；逾時且沒有看到 master，
    才消耗這份授權並允許初始化。這個操作是磁碟初次佈署的一部分，不需另一套 pack。
@@ -183,9 +233,12 @@ nomad-pack plan docker/runtime/nomad -f /path/to/cluster.hcl --name doris
 nomad-pack run docker/runtime/nomad -f /path/to/cluster.hcl --name doris
 ```
 
-只需執行一個 pack。第一次 bootstrap 預設會先探測 120 秒；其他 allocation
-可能先逾時而被重新排程，之後會加入已建立的叢集。Doris 初始化和 quorum 恢復
-需要時間，請查看 `prepare` 日誌，而非只看容器是否立即出現。
+只需執行一個 pack，之後不需要再下指令。第一次部署時 bootstrap FE 會先探測
+`discovery_timeout`（預設 120 秒）確認沒有既有 master，才消耗授權檔、以 master 啟動。
+這段期間其他 FE／BE 可能逾時失敗，Nomad UI 會暫時看到 failed allocations；它們會
+依 `reschedule` 自動重新排程（指數退避，最長 2 分鐘），等 master 起來後自行加入。
+這是預期行為，不需介入。Doris 初始化需要時間，請查看 `prepare` 日誌，而非只看
+容器是否立即出現。
 
 ```bash
 nomad job status doris
@@ -193,40 +246,43 @@ nomad alloc logs <allocation-id> prepare
 nomad alloc logs <allocation-id> doris
 ```
 
-使用 Consul 時，`sql-ready` check 以已認證 SQL 確認 FE 已 Join、Alive 且看得到
-存活的 master，BE 在 `SHOW BACKENDS` 中為 Alive；`nomad` provider 只有 TCP 與
-FE `/api/health`。兩者都**不代表 metadata 已追平或 BE 所有 tablet 都健康**，
+`sql-ready` check 以已認證 SQL 確認 FE 已 Join、Alive 且看得到存活的 master，
+BE 在 `SHOW BACKENDS` 中為 Alive。它**不代表 metadata 已追平或 BE 所有 tablet 都健康**，
 更新下一台 FE 前仍應以 SQL 確認 `ReplayedJournalId` 等追趕狀態。
 
-## Service provider：consul（預設）或 nomad
+## Consul services
 
-預設 `service_provider = "consul"`。所有 checks 都會作為 `update` 區塊的部署健康依據：
-`max_parallel = 1` 的 group 更新會等節點真正可用，才算健康。
+所有服務都註冊到 Consul（不支援 Nomad 內建 service provider：它沒有 script check，
+也無法提供 prestart 的 FE 探索與 DNS）。所有 checks 都會作為 `update` 區塊的部署
+健康依據：`max_parallel = 1` 的 group 更新會等節點真正可用，才算健康。
 
-| 功能 | `consul` | `nomad` |
-| --- | --- | --- |
-| `<job>-fe`（9030）、`<job>-be`（9050），TCP check | 有 | 有 |
-| `<job>-fe-http`（8030），`GET /api/health` | 有 | 有 |
-| `sql-ready` script check（`scripts/ready.sh`） | 有 | 不支援 script check |
-| prestart 從服務目錄探索 FE | 有 | 無，只用 `discovery_fe_ips` |
-| DNS（例如 `doris-fe.service.consul`） | 有 | 無 |
+| 服務 | Port | Checks | Tags |
+| --- | --- | --- | --- |
+| `<job>-fe` | 9030（query） | TCP、`sql-ready` | `fe`, `query` |
+| `<job>-fe-http` | 8030 | `GET /api/health` | `fe`, `http` |
+| `<job>-fe-editlog` | 9010 | TCP | `editlog`, `fe-id-<index>` |
+| `<job>-fe-flight` | 8070 | TCP | `flight`, `arrow-flight-sql`, `fe-id-<index>` |
+| `<job>-be` | 9050（heartbeat） | TCP、`sql-ready` | `be`, `heartbeat` |
+| `<job>-be-flight` | 8050 | TCP | `flight`, `arrow-flight-sql`, `be-id-<index>` |
 
-每個服務都帶 `tags = [<fe|be>, <port 名稱>]` 與 `meta.node = <Nomad client name>`。
+`<index>` 是節點在 `fe_nodes`／`be_nodes` 中的位置。每個服務都帶
+`meta.node = <Nomad client name>`。健康的 `<job>-fe` 也提供 prestart 的 FE 探索與
+Consul DNS（例如 `doris-fe.service.consul`）。
 
-### sql-ready check（`scripts/ready.sh`）
+### sql-ready check（`scripts/consul_ready.sh`）
 
 **目的**：判斷節點是否真的可以使用，而不只是 port 已開啟。TCP check 在 9030／9050
 開始監聽時就會通過，但此時 FE 可能尚未 Join、仍在追 metadata 或看不到 master，
 BE 可能尚未註冊或 FE 尚未收到它的 heartbeat。`update` 區塊依 checks 判斷部署健康，
 只看 TCP 時，逐台升級可能在上一台 FE 真的可用之前就開始更新下一台。
 
-**判斷方式**：Nomad 在主容器內執行 `/bin/bash /local/ready.sh`，使用同一份
+**判斷方式**：Nomad 在主容器內執行 `/bin/bash /local/consul_ready.sh`，使用同一份
 `/secrets/my.cnf` 以 root 帳號執行 SQL：
 
-- FE（`ready.sh fe <ip>`）：詢問本機 FE 的 `SHOW FRONTENDS`，自身列
+- FE（`consul_ready.sh fe <ip>`）：詢問本機 FE 的 `SHOW FRONTENDS`，自身列
   （IP + EditLogPort 9010）須 `Join = true`、`Alive = true`，且看得到
   `IsMaster = true`、`Alive = true` 的列。
-- BE（`ready.sh be <ip> <seed>...`）：依序詢問 prestart 選定的 master
+- BE（`consul_ready.sh be <ip> <seed>...`）：依序詢問 prestart 選定的 master
   （經 `BASH_ENV` 取得 `FE_MASTER_IP`）與 `discovery_fe_ips`，由第一台有回應的 FE
   確認自身列（IP + HeartbeatPort 9050）`Alive = true`。
 
@@ -242,14 +298,13 @@ alive`，可在 Consul UI 的 check output 查看）並回傳 2（critical），
   詢問 master。
 - 不重啟 Doris：未設定 `check_restart`，master 暫時不可用等狀況只改變健康狀態。
 
-**限制**：只在 `service_provider = "consul"` 時產生（Nomad 內建 provider 不支援
-script check）。它不檢查 metadata 是否追平（例如 `ReplayedJournalId`），也不檢查
+**限制**：它不檢查 metadata 是否追平（例如 `ReplayedJournalId`），也不檢查
 BE tablet 健康；升級下一台 FE 前仍應以 SQL 確認追趕狀態。
 
 ### `/api/health`
 
 FE 尚未完成啟動時回 503；目前 master 程式碼中此端點一律不需認證。較舊版本在
-`enable_all_http_auth = true` 時會要求認證，兩種 provider 的這個 check 都會持續
+`enable_all_http_auth = true` 時會要求認證，這個 check 會持續
 失敗並卡住部署；請先在實際 image 上確認 `curl -i http://<fe>:8030/api/health`
 回 200，否則升級 image 或關閉該設定。
 
@@ -268,10 +323,8 @@ allocation 失敗並重新排程。因此 `discovery_fe_ips` 仍為必填。
   `service_identity` 與 `task_identity`），讓服務註冊與 `prepare` task 的
   `service` template 取得 token；task identity 對應的 policy 至少需要
   `service "<job>-fe" { policy = "read" }` 與 `node_prefix "" { policy = "read" }`。
-- 沒有 Consul 時設定 `service_provider = "nomad"`，功能依上表縮減。
 
-切換 provider 或升級到本版會改動每個 group 的 services，需依上文的逐組 rollout
-或維護停機方式套用。
+只有「已在運行、用舊版 pack 部署的叢集」升級到本版時，才需要注意：每個 group 的 services 與 env 都會改變，需依上文的逐組 rollout 或維護停機方式套用。全新部署不受影響。
 
 ## 重啟與 master 切換
 
@@ -313,8 +366,8 @@ nomad job restart -reschedule -group=be-doris-1 doris
 
 ## 擴容與升級
 
-新增 FE／BE 時，只在同一份 `cluster.hcl` 對應 list 增加一個 map，預先準備
-該 host volume，再執行同樣的 `plan`／`run`。**不要同時修改 `discovery_fe_ips`**：
+新增 FE／BE 時，只在同一份 `cluster.hcl` 對應 list 的**最後**增加一個 map（overrides
+以 index 為 key，插在中間會讓後面的節點對應錯誤），預先準備該節點的 host volumes，再執行同樣的 `plan`／`run`。**不要同時修改 `discovery_fe_ips`**：
 把完整節點清單注入每個既有 group 會造成配置改變，使擴容變成全叢集更新。
 Seeds 只需有一台可連線且能回報現任 master；master 本身不必在 seed 清單。
 所有 seeds 都不可用時，新節點加入會等待，既有 FE 仍可啟動。
@@ -323,10 +376,36 @@ FE 建議維持適當的奇數個 electable members；本範例新增 FE 一律�
 不能藉由刪除 list entry 安全縮容：BE 要先 decommission，FE 要依 Doris membership
 維護程序移除。本 pack 不自動 DROP 成員或刪除資料。
 
-每個節點有自己的 `image`，升級時一次只改一個 FE 的 image，plan 應只更換那個
-FE group；確認 SQL 健康後再更新下一台。`max_parallel=1` 是 **每個 group** 的限制，
+image 為 `<fe|be>_image_repo:<fe|be>-<doris_version>`。升級時不要直接改
+`doris_version`（會一次改動所有 groups），而是用 `fe_version_overrides`／
+`be_version_overrides`（以 list index 字串為 key，例如 `{ "0" = "4.1.5" }`）一次只改
+一個 FE，plan 應只更換那個 FE group；確認 SQL 健康後再更新下一台，全部完成後再改
+`doris_version` 並清空 overrides。`max_parallel=1` 是 **每個 group** 的限制，
 並不保證不同 FE groups 依序更新。修改共用模板、資源參數或 seed 清單也可能影響
 所有 groups；不要直接把這類更新套到正式叢集，需安排逐組 rollout 或維護停機。
+
+## 重建叢集
+
+要放棄現有資料、重新 bootstrap 時，host volume plugin 看到目錄已有資料會略過，
+無法替你清空；請在 bastion 用 `scripts/wipe-volumes.sh`。它會**刪除該 job 所有
+FE（meta、log）與 BE（每顆 disk）資料**，無法復原：
+
+```bash
+nomad job stop -namespace=doris doris        # 必須先停止，且沒有 running/pending allocations
+scripts/wipe-volumes.sh --dry-run "${ARGS[@]}"        # 列出會清空的節點與路徑（ARGS 同上）
+scripts/wipe-volumes.sh --confirm=doris "${ARGS[@]}"
+scripts/bootstrap-permit.sh "${ARGS[@]}"
+nomad-pack run "${ARGS[@]}"
+```
+
+- 參數與 `bootstrap-permit.sh` 相同（即 `nomad-pack run` 的參數）；group 與 volume
+  來自本機 render，路徑來自 Nomad node API。連線與 SSH 設定也相同。
+- 在 job 可能所在的每個 namespace（render 出的、`--namespace`、`NOMAD_NAMESPACE`）
+  確認 job 不存在，或已 stop 且沒有 running／pending allocations，否則拒絕執行。
+- `--confirm` 必須等於 var-file 的 `job_name`。所有節點與 volume 都查得到才開始刪除。
+- 遠端主機必須擁有該節點的 IP；每個路徑都必須存在、是目錄、且不是 `/` 或第一層目錄
+  （例如 `/data`），全部通過才刪除。只刪除目錄內容：保留目錄本身與 `lost+found`，
+  不跨入其下掛載的其他檔案系統。
 
 ## 密碼、資料卷與 bootstrap 的界線
 
@@ -351,7 +430,7 @@ Vault KV v2 是唯一的密碼來源，secret 必須保存**明文** root 密碼
 
 | 檔案 | 格式 | 產生於 | 用途 |
 | --- | --- | --- | --- |
-| `secrets/my.cnf` | INI，密碼經跳脫（`\`、`"`、換行、CR、tab） | 所有 FE／BE 的 `prepare` 與 `doris` tasks | mysql client 以 root 登入：原入口、prestart、`ready.sh` |
+| `secrets/my.cnf` | INI，密碼經跳脫（`\`、`"`、換行、CR、tab） | 所有 FE／BE 的 `prepare` 與 `doris` tasks | mysql client 以 root 登入：原入口、prestart、`consul_ready.sh` |
 | `secrets/root-password` | 原始 bytes，不跳脫、無前後空白 | 只有 FE 的 `prepare` task | prestart 計算 `initial_root_password` |
 
 **為什麼要計算 hash**：Doris 的 `initial_root_password` 只接受 2-staged SHA-1 格式
@@ -380,7 +459,8 @@ hash 只能在 prestart 計算；若從 `my.cnf` 計算，必須先在 Bash 中�
 在 repository root 執行：
 
 ```bash
-bash -n docker/runtime/nomad/scripts/prestart.sh docker/runtime/nomad/scripts/ready.sh
+bash -n docker/runtime/nomad/scripts/prestart.sh docker/runtime/nomad/scripts/consul_ready.sh docker/runtime/nomad/scripts/bootstrap-permit.sh \
+  docker/runtime/nomad/scripts/wipe-volumes.sh docker/runtime/nomad/scripts/ops-common.sh
 python3 -m unittest discover -s docker/runtime/nomad/tests -v
 # 僅 Nomad Pack 0.4.2 以上有 fmt；0.4.1 略過此步驟
 nomad-pack fmt -check -recursive docker/runtime/nomad

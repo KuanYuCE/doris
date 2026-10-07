@@ -17,6 +17,10 @@
 
 [[ define "credentials" ]]
 [[ $root := .root ]]
+[[ $key := var "vault_password_key" $root ]]
+[[/* Field access, unlike index, honours error_on_missing_key: a missing key
+     fails the template instead of rendering an empty password. */]]
+[[ if not (regexMatch "^[A-Za-z_][A-Za-z0-9_]*$" $key) ]][[ fail "vault_password_key must be a template identifier ([A-Za-z_][A-Za-z0-9_]*)" ]][[ end ]]
 vault {
   role         = [[ var "vault_role" $root | quote ]]
   env          = false
@@ -31,12 +35,10 @@ template {
   error_on_missing_key = true
   once                 = true
   data                 = <<EOF
-{{- with secret [[ var "vault_secret_path" $root | quote ]] }}
-{{- with index .Data.data [[ var "vault_password_key" $root | quote ]] }}
+{{ with secret [[ var "vault_secret_path" $root | quote ]] }}
 [client]
-password="{{ . | replaceAll "\\" "\\\\" | replaceAll "\"" "\\\"" | replaceAll "\n" "\\n" | replaceAll "\r" "\\r" | replaceAll "\t" "\\t" }}"
-{{ end -}}
-{{- end }}
+password="{{ .Data.data.[[ $key ]] | replaceAll "\\" "\\\\" | replaceAll "\"" "\\\"" | replaceAll "\n" "\\n" | replaceAll "\r" "\\r" | replaceAll "\t" "\\t" }}"
+{{ end }}
 EOF
 }
 [[ if and .prepare (eq .kind "fe") ]]
@@ -49,11 +51,7 @@ template {
   once                 = true
   # Whitespace trimming preserves the exact password bytes for hashing.
   data = <<EOF
-{{- with secret [[ var "vault_secret_path" $root | quote ]] -}}
-{{- with index .Data.data [[ var "vault_password_key" $root | quote ]] -}}
-{{ . }}
-{{- end -}}
-{{- end -}}
+{{- with secret [[ var "vault_secret_path" $root | quote ]] -}}{{ .Data.data.[[ $key ]] }}{{- end -}}
 EOF
 }
 [[ end ]]

@@ -33,7 +33,6 @@
 [[ $seeds := var "discovery_fe_ips" . ]]
 [[ if not $seeds ]][[ fail "discovery_fe_ips must not be empty" ]][[ end ]]
 
-
 job [[ var "job_name" . | quote ]] {
   namespace   = [[ var "namespace" . | quote ]]
   datacenters = [[ var "datacenters" . | toJson ]]
@@ -57,9 +56,6 @@ job [[ var "job_name" . | quote ]] {
     value     = [[ var "meta_pool" . | quote ]]
   }
   [[- end ]]
-
-
-
 
   [[ range $kind, $nodes := dict "fe" $feNodes "be" $beNodes ]]
   [[ range $idx, $node := $nodes ]]
@@ -142,8 +138,7 @@ job [[ var "job_name" . | quote ]] {
       driver = "docker"
       user   = "0"
       config {
-        
- image        = "[[ ternary (var "fe_image_repo" $root) (var "be_image_repo" $root) (eq $kind "fe") ]]:[[ $kind ]]-[[ template "versionOverride" (list (var (printf "%s_version_overrides" $kind) $root) (printf "%v" $idx) (var "doris_version" $root)) ]]" 
+        image        = "[[ ternary (var "fe_image_repo" $root) (var "be_image_repo" $root) (eq $kind "fe") ]]:[[ $kind ]]-[[ template "versionOverride" (list (var (printf "%s_version_overrides" $kind) $root) (printf "%v" $idx) (var "doris_version" $root)) ]]"
         network_mode = "host"
         # Only this short-lived helper overrides the image entrypoint.
         entrypoint = ["/bin/bash", "/local/prestart.sh"]
@@ -161,6 +156,10 @@ job [[ var "job_name" . | quote ]] {
         CONSUL_FE_FILE = "/local/consul-fe"
         [[ if eq $kind "be" ]]
         BE_DISK_COUNT = [[ var "be_disks_per_block" $root | toString | quote ]]
+        [[ else ]]
+        # Named in the bootstrap error and read by scripts/bootstrap-permit.sh.
+        META_VOLUME = "[[ template "blockVolumeName" (list "fe" $node.block_index 0) ]]"
+        NODE_NAME   = [[ $node.hostname | quote ]]
         [[ end ]]
       }
       [[ if eq $kind "fe" ]]
@@ -207,16 +206,13 @@ EOF
       kill_timeout   = "2m"
       shutdown_delay = "10s"
       config {
-        image        = [[ $node.image | quote ]]
+        image        = "[[ ternary (var "fe_image_repo" $root) (var "be_image_repo" $root) (eq $kind "fe") ]]:[[ $kind ]]-[[ template "versionOverride" (list (var (printf "%s_version_overrides" $kind) $root) (printf "%v" $idx) (var "doris_version" $root)) ]]"
         network_mode = "host"
         # No command, args, or entrypoint override: use the original image.
         volumes = [
           "secrets/my.cnf:/root/.my.cnf:ro",
           [[ printf "../alloc/data/conf:/opt/apache-doris/%s/conf" $kind | quote ]],
         ]
-        ulimit {
-          nofile = "65536:65536"
-        }
       }
       env {
         HOME     = "/root"
@@ -240,28 +236,22 @@ EOF
       }
       [[ else ]]
       [[ range $d := until (var "be_disks_per_block" $root) ]]
-
-
       volume_mount {
-         volume      = "storage[[ add1 $d ]]"
+        volume      = "storage[[ add1 $d ]]"
         destination = "/opt/apache-doris/be/storage/data[[ add1 $d ]]"
       }
-
       [[ end ]]
       [[ end ]]
       [[ template "credentials" (dict "root" $root "kind" $kind "prepare" false) ]]
       [[ $port := ternary "query" "heartbeat" (eq $kind "fe") ]]
-      [[ if eq $provider "consul" ]]
       template {
-     
-destination = "local/consul_ready.sh"
+        destination = "local/consul_ready.sh"
         perms       = "0644"
         once        = true
-     data        = [[ fileContents (printf "%s/scripts/consul_ready.sh" $packPath) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
+        data        = [[ fileContents (printf "%s/scripts/consul_ready.sh" $packPath) | replace "${" "$${" | replace "%{" "%%{" | toJson ]]
       }
-      [[ end ]]
       service {
-       provider = "consul"
+        provider = "consul"
         name     = [[ printf "%s-%s" (var "job_name" $root) $kind | quote ]]
         port     = [[ $port | quote ]]
         address  = [[ $node.ip | quote ]]
@@ -275,7 +265,6 @@ destination = "local/consul_ready.sh"
           interval = "10s"
           timeout  = "2s"
         }
-        [[ if eq $provider "consul" ]]
         # Authenticated membership readiness; also gates deployments.
         check {
           name     = "sql-ready"
@@ -285,7 +274,6 @@ destination = "local/consul_ready.sh"
           interval = "15s"
           timeout  = "10s"
         }
-        [[ end ]]
       }
       [[ if eq $kind "fe" ]]
       service {
@@ -302,7 +290,7 @@ destination = "local/consul_ready.sh"
           port     = "edit_log"
           interval = "10s"
           timeout  = "3s"
-       }
+        }
       }
       [[ end ]]
       service {
@@ -312,7 +300,7 @@ destination = "local/consul_ready.sh"
         address  = [[ $node.ip | quote ]]
         tags     = ["flight", "arrow-flight-sql", [[ printf "%s-id-%v" $kind $idx | quote ]]]
         meta {
-        node = [[ $node.hostname | quote ]]
+          node = [[ $node.hostname | quote ]]
         }
         check {
           type     = "tcp"
@@ -324,8 +312,6 @@ destination = "local/consul_ready.sh"
       [[ if eq $kind "fe" ]]
       service {
         provider = "consul"
-
-
         name     = [[ printf "%s-fe-http" (var "job_name" $root) | quote ]]
         port     = "http"
         address  = [[ $node.ip | quote ]]

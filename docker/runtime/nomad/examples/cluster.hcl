@@ -29,7 +29,6 @@ vault_role         = "doris"
 vault_secret_path  = "kv-data/data/doris-secret/connection"
 vault_password_key = "my_key"
 
-
 # Independent configuration fragments; image defaults remain in effect.
 fe_config = <<EOF
 sys_log_level = INFO
@@ -51,16 +50,18 @@ meta_service       = "doris"
 meta_pool          = "shared"
 
 # hostname must match `nomad node status` Name, not an arbitrary Docker hostname.
-# Set images per node so an upgrade changes only one FE group at a time.
+# block_index selects the node's DHV volumes (see blockVolumeName in
+# templates/_helpers.tpl): FE uses disks 0 (meta) and 1 (log), BE uses disks
+# 0 .. be_disks_per_block-1. Use fe_version_overrides / be_version_overrides,
+# keyed by list index, to upgrade one group at a time.
 fe_nodes = [
-  { ip = "10.0.0.11", hostname = "doris-1, volume = "doris-fe", image = "apache/doris:fe-4.1.4" },
-  { ip = "10.0.0.12", hostname = "doris-2", volume = "doris-fe", image = "apache/doris:fe-4.1.4" },
-  { ip = "10.0.0.13", hostname = "doris-3", volume = "doris-fe", image = "apache/doris:fe-4.1.4" },
-  { ip = "10.0.0.11", hostname = "doris-1,  block_index=2},
+  { ip = "10.0.0.11", hostname = "doris-1", block_index = 0 },
+  { ip = "10.0.0.12", hostname = "doris-2", block_index = 0 },
+  { ip = "10.0.0.13", hostname = "doris-3", block_index = 0 },
 ]
 
 be_nodes = [
-  { ip = "10.0.0.11", hostname = "doris-1", volume = "doris-be", image = "apache/doris:be-4.1.4" },
-  { ip = "10.0.0.12", hostname = "doris-2", volume = "doris-be", image = "apache/doris:be-4.1.4" },
-  { ip = "10.0.0.13", hostname = "doris-3", volume = "doris-be", image = "apache/doris:be-4.1.4" },
+  { ip = "10.0.0.11", hostname = "doris-1", block_index = 0 },
+  { ip = "10.0.0.12", hostname = "doris-2", block_index = 0 },
+  { ip = "10.0.0.13", hostname = "doris-3", block_index = 0 },
 ]

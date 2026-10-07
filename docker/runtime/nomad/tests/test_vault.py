@@ -20,6 +20,7 @@
 No existing Vault address, token or namespace is used. All secrets are synthetic.
 """
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -67,7 +68,11 @@ class VaultTemplateTest(unittest.TestCase):
                                        (cls.base / "server.log").read_text())
                 time.sleep(0.1)
         cls.request("POST", "sys/mounts/kv-data", {"type": "kv", "options": {"version": "2"}})
-        job = test_pack.PackTest().render()
+        # Pin the path and key this test writes, independent of the example.
+        job = test_pack.PackTest().render([
+            "--var", "vault_secret_path=kv-data/data/doris-secret/bootstrap",
+            "--var", "vault_password_key=password",
+        ])
         group = next(g for g in job["TaskGroups"] if g["Name"].startswith("fe-"))
         prepare = next(t for t in group["Tasks"] if t["Name"] == "prepare")
         cls.templates = {t["DestPath"]: t["EmbeddedTmpl"] for t in prepare["Templates"]}
@@ -95,7 +100,15 @@ class VaultTemplateTest(unittest.TestCase):
             return response.read()
 
     def render_password(self, password):
-        self.request("POST", "kv-data/data/doris-secret/bootstrap", {"data": {"password": password}})
+        with self.run_agent({"password": password}) as (result, path):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((path / "root-password").read_bytes(), password.encode())
+            self.assertEqual((path / "my.cnf").stat().st_mode & 0o777, 0o600)
+            return (path / "my.cnf").read_text().strip()
+
+    @contextlib.contextmanager
+    def run_agent(self, data):
+        self.request("POST", "kv-data/data/doris-secret/bootstrap", {"data": data})
         with tempfile.TemporaryDirectory(dir=self.base) as tmp:
             path = Path(tmp)
             (path / "token").write_text(self.token)
@@ -122,10 +135,13 @@ class VaultTemplateTest(unittest.TestCase):
                 ["vault", "agent", f"-config={path / 'agent.hcl'}"],
                 env=self.env, text=True, capture_output=True, timeout=30,
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((path / "root-password").read_bytes(), password.encode())
-            self.assertEqual((path / "my.cnf").stat().st_mode & 0o777, 0o600)
-            return (path / "my.cnf").read_text().strip()
+            yield result, path
+
+    def test_missing_key_fails_instead_of_rendering_empty(self):
+        with self.run_agent({"other": "root@123"}) as (result, path):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("password", result.stderr)
+            self.assertFalse((path / "root-password").exists())
 
     def test_kv_v2_password_rendering(self):
         self.assertEqual(self.render_password("root@123"), '[client]\npassword="root@123"')

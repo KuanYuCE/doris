@@ -62,27 +62,40 @@ class PackTest(unittest.TestCase):
                              (ROOT / "scripts/prestart.sh").read_text())
             self.assertEqual(templates["secrets/my.cnf"]["Perms"], "0600")
 
-    def test_only_fe_prepare_mounts_the_data_volume(self):
+    def test_only_fe_prepare_mounts_block_volumes(self):
         job = self.render()
         for group in job["TaskGroups"]:
             kind = group["Name"].split("-")[0]
             tasks = {t["Name"]: t for t in group["Tasks"]}
-            data_dir = "doris-meta" if kind == "fe" else "storage"
+            sources = {name: v["Source"] for name, v in group["Volumes"].items()}
             main_mounts = [(m["Volume"], m["Destination"], bool(m["ReadOnly"]))
                            for m in tasks["doris"]["VolumeMounts"]]
-            self.assertEqual(main_mounts, [("data", f"/opt/apache-doris/{kind}/{data_dir}", False)])
             prepare_mounts = [(m["Volume"], m["Destination"], bool(m["ReadOnly"]))
                               for m in tasks["prepare"]["VolumeMounts"] or []]
             if kind == "fe":
+                self.assertEqual(sources, {"meta": "doris-fe-b0-d0", "log": "doris-fe-b0-d1"})
+                self.assertEqual(main_mounts, [
+                    ("meta", "/opt/apache-doris/fe/doris-meta", False),
+                    ("log", "/opt/apache-doris/fe/log", False),
+                ])
                 # Read-write: prestart renames the bootstrap permit.
-                self.assertEqual(prepare_mounts, [("data", "/opt/apache-doris/fe/doris-meta", False)])
+                self.assertEqual(prepare_mounts, [("meta", "/opt/apache-doris/fe/doris-meta", False)])
+                env = tasks["prepare"]["Env"]
+                self.assertEqual((env["META_VOLUME"], env["NODE_NAME"]),
+                                 (sources["meta"], group["Name"][len("fe-"):]))
             else:
+                self.assertEqual(sources, {"storage1": "doris-be-b0-d0", "storage2": "doris-be-b0-d1"})
+                self.assertEqual(main_mounts, [
+                    ("storage1", "/opt/apache-doris/be/storage/data1", False),
+                    ("storage2", "/opt/apache-doris/be/storage/data2", False),
+                ])
                 self.assertEqual(prepare_mounts, [])
+                self.assertEqual(tasks["prepare"]["Env"]["BE_DISK_COUNT"], "2")
 
     def test_adding_fe_does_not_change_existing_groups(self):
         before = self.render()
-        nodes = [dict(ip=f"10.0.0.{10+i}", hostname=f"doris-{i}", volume="doris-fe",
-                      image="apache/doris:fe-4.1.4") for i in range(1, 5)]
+        nodes = [dict(ip=f"10.0.0.{10+i}", hostname=f"doris-{i}", block_index=0)
+                 for i in range(1, 5)]
         # JSON is valid as the expression part of a --var override.
         after = self.render(["--var", "fe_nodes=" + json.dumps(nodes)])
         existing = {g["Name"]: g for g in before["TaskGroups"]}
@@ -120,7 +133,7 @@ class PackTest(unittest.TestCase):
                 self.assertFalse(task["Vault"]["Env"])
                 self.assertTrue(task["Vault"]["DisableFile"])
                 templates = {t["DestPath"]: t for t in task["Templates"]}
-                self.assertIn('secret "kv-data/data/doris-secret/bootstrap"',
+                self.assertIn('secret "kv-data/data/doris-secret/connection"',
                               templates["secrets/my.cnf"]["EmbeddedTmpl"])
                 # Vault is the only credential source.
                 for template in templates.values():
@@ -137,15 +150,18 @@ class PackTest(unittest.TestCase):
             tasks = {t["Name"]: t for t in group["Tasks"]}
             prepare, main = tasks["prepare"], tasks["doris"]
             services = {s["Name"]: s for s in main["Services"]}
-            expected = {f"doris-{kind}"} | ({"doris-fe-http"} if kind == "fe" else set())
+            expected = {f"doris-{kind}", f"doris-{kind}-flight"}
+            if kind == "fe":
+                expected |= {"doris-fe-http", "doris-fe-editlog"}
             self.assertEqual(set(services), expected)
             for service in services.values():
                 self.assertEqual(service["Provider"], "consul")
-                self.assertEqual(service["Tags"][0], kind)
+            for name in expected - {f"doris-{kind}-flight", "doris-fe-editlog"}:
+                self.assertEqual(services[name]["Tags"][0], kind)
             checks = {c["Name"]: c for c in services[f"doris-{kind}"]["Checks"]}
             ready = checks["sql-ready"]
             self.assertEqual(ready["Type"], "script")
-            self.assertEqual(ready["Args"][:2], ["/local/ready.sh", kind])
+            self.assertEqual(ready["Args"][:2], ["/local/consul_ready.sh", kind])
             if kind == "be":
                 # BE readiness asks the static seeds after the prestart master.
                 self.assertEqual(ready["Args"][3:], ["10.0.0.11", "10.0.0.12", "10.0.0.13"])
@@ -154,27 +170,12 @@ class PackTest(unittest.TestCase):
                 http = services["doris-fe-http"]["Checks"][0]
                 self.assertEqual((http["Type"], http["Path"]), ("http", "/api/health"))
             templates = {t["DestPath"]: t for t in main["Templates"]}
-            self.assertEqual(templates["local/ready.sh"]["EmbeddedTmpl"],
-                             (ROOT / "scripts/ready.sh").read_text())
+            self.assertEqual(templates["local/consul_ready.sh"]["EmbeddedTmpl"],
+                             (ROOT / "scripts/consul_ready.sh").read_text())
             prepare_templates = {t["DestPath"]: t for t in prepare["Templates"]}
             self.assertIn('service "doris-fe"', prepare_templates["local/consul-fe"]["EmbeddedTmpl"])
             self.assertEqual(prepare["Env"]["CONSUL_FE_FILE"], "/local/consul-fe")
 
-    def test_nomad_service_provider_has_no_consul_features(self):
-        job = self.render(["--var", "service_provider=nomad"])
-        for group in job["TaskGroups"]:
-            tasks = {t["Name"]: t for t in group["Tasks"]}
-            prepare, main = tasks["prepare"], tasks["doris"]
-            for service in main["Services"]:
-                self.assertEqual(service["Provider"], "nomad")
-                self.assertTrue(all(c["Type"] in ("tcp", "http") for c in service["Checks"]))
-            self.assertNotIn("local/ready.sh", {t["DestPath"] for t in main["Templates"]})
-            self.assertNotIn("local/consul-fe", {t["DestPath"] for t in prepare["Templates"]})
-            self.assertNotIn("CONSUL_FE_FILE", prepare["Env"])
-
-    def test_unknown_service_provider_is_rejected(self):
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.render(["--var", "service_provider=dns"])
 
 if __name__ == "__main__":
     unittest.main()

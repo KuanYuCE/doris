@@ -64,7 +64,7 @@ class ReadyTest(unittest.TestCase):
 
     def ready(self, *args):
         return subprocess.run(
-            ["bash", str(ROOT / "scripts/ready.sh"), *args], env=self.env,
+            ["bash", str(ROOT / "scripts/consul_ready.sh"), *args], env=self.env,
             text=True, capture_output=True, timeout=10,
         )
 
