@@ -23,14 +23,12 @@
 job_name    = "doris"
 namespace   = "default"
 datacenters = ["dc1"]
-
-# consul adds SQL readiness checks, Consul discovery and DNS; use "nomad"
-# when the clients do not run a Consul agent.
-service_provider = "consul"
+node_pool   = "doris"
 
 vault_role         = "doris"
-vault_secret_path  = "kv-data/data/doris-secret/bootstrap"
-vault_password_key = "password"
+vault_secret_path  = "kv-data/data/doris-secret/connection"
+vault_password_key = "my_key"
+
 
 # Independent configuration fragments; image defaults remain in effect.
 fe_config = <<EOF
@@ -44,12 +42,21 @@ EOF
 bootstrap_fe     = "10.0.0.11"
 discovery_fe_ips = ["10.0.0.11", "10.0.0.12", "10.0.0.13"]
 
+doris_version = "4.1.4"
+fe_image_repo = "apache/doris"
+be_image_repo = "apache/doris"
+
+be_disks_per_block = 2
+meta_service       = "doris"
+meta_pool          = "shared"
+
 # hostname must match `nomad node status` Name, not an arbitrary Docker hostname.
 # Set images per node so an upgrade changes only one FE group at a time.
 fe_nodes = [
-  { ip = "10.0.0.11", hostname = "doris-1", volume = "doris-fe", image = "apache/doris:fe-4.1.4" },
+  { ip = "10.0.0.11", hostname = "doris-1, volume = "doris-fe", image = "apache/doris:fe-4.1.4" },
   { ip = "10.0.0.12", hostname = "doris-2", volume = "doris-fe", image = "apache/doris:fe-4.1.4" },
   { ip = "10.0.0.13", hostname = "doris-3", volume = "doris-fe", image = "apache/doris:fe-4.1.4" },
+  { ip = "10.0.0.11", hostname = "doris-1,  block_index=2},
 ]
 
 be_nodes = [
