@@ -32,6 +32,11 @@ variable "datacenters" {
   default     = ["dc1"]
   description = "Eligible Nomad datacenters."
 }
+variable "node_pool" {
+  type        = string
+  default     = "doris"
+  description = "Nomad node pool that Doris FE/BE run in."
+}
 
 variable "bootstrap_fe" {
   type        = string
@@ -45,20 +50,18 @@ variable "discovery_fe_ips" {
 
 variable "fe_nodes" {
   type = list(object({
-    ip       = string
-    hostname = string
-    volume   = string
-    image    = string
+    ip          = string
+    hostname    = string
+    block_index = number
   }))
   description = "Stable FE identities. hostname is the Nomad client node name; volume is its host volume."
 }
 
 variable "be_nodes" {
   type = list(object({
-    ip       = string
-    hostname = string
-    volume   = string
-    image    = string
+    ip          = string
+    hostname    = string
+    block_index = number
   }))
   description = "Stable BE identities, with a persistent host volume and per-node image."
 }
@@ -92,12 +95,48 @@ variable "be_memory" {
   default     = 16384
   description = "BE memory limit in MiB."
 }
-
-variable "service_provider" {
+variable "doris_version" {
   type        = string
-  default     = "consul"
-  description = "Register FE/BE services with consul (default; requires Consul on every client) or nomad (built-in)."
+  default     = "4.1.4"
+  description = "Default Doris image tag (both FE and BE), unless overridden per-node."
 }
+variable "fe_image_repo" {
+  type        = string
+  description = "Image repository for the FE image (tag is :fe-<version>)."
+}
+
+variable "be_image_repo" {
+  type        = string
+  description = "Image repository for the BE image (tag is :be-<version>)."
+}
+variable "fe_version_overrides" {
+  type        = map(string)
+  default     = {}
+  description = "Per-FE version overrides, keyed by fe_nodes index as a string."
+}
+variable "be_version_overrides" {
+  type        = map(string)
+  default     = {}
+  description = "Per-BE version overrides, keyed by be_nodes index as a string."
+}
+
+variable "be_disks_per_block" {
+  type        = number
+  default     = 2
+  description = "Number of disks per BE resource block to mount as storage (must be <= the DHV plugin's disks_per_block)."
+}
+variable "meta_service" {
+  type        = string
+  default     = "doris"
+  description = "Value expected in client meta.service for a node to be eligible."
+}
+variable "meta_pool" {
+  type        = string
+  default     = "shared"
+  description = "Value expected in client meta.pool. Set to \"\" to disable this constraint."
+}
+
+
 
 variable "vault_secret_path" {
   type        = string
