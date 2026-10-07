@@ -27,7 +27,7 @@ CONFIG_OVERRIDES_FILE=${CONFIG_OVERRIDES_FILE:-}
 CONSUL_FE_FILE=${CONSUL_FE_FILE:-}
 DISCOVERY_TIMEOUT=${DISCOVERY_TIMEOUT:-300}
 POLL_INTERVAL=${POLL_INTERVAL:-2}
-
+BE_DISK_COUNT=${BE_DISK_COUNT:-}
 fail() { echo "prestart: $*" >&2; exit 1; }
 
 validate_ip() {
@@ -94,18 +94,54 @@ prepare_config() {
     fi
     # Preserve distribution defaults (including JVM flags). Both upstream init
     # scripts append a /24 priority_networks on new nodes, so use the same subnet.
-    printf '\npriority_networks = %s.0/24\n' "${NODE_IP%.*}" >> "$conf"
+    # printf '\npriority_networks = %s.0/24\n' "${NODE_IP%.*}" >> "$conf"
+    if [[ $NODE_KIND == fe ]]; then
+        printf 'priority_networks = %s/32\n' "$NODE_IP" > "$ALLOC_DATA/conf/fe_custom.conf"
+        chmod 600 "$ALLOC_DATA/conf/fe_custom.conf"
+    else
+        printf '\npriority_networks = %s/32\n' "$NODE_IP" >> "$conf"
+    
     if [[ $NODE_KIND == fe ]]; then
         # MySQL PASSWORD() format of the exact Vault bytes:
         # '*' + uppercase hex(SHA1(SHA1(password))).
         [[ -s $ROOT_PASSWORD_FILE ]] || fail "Vault root password is empty"
+
+        local attempt
+        for attempt in 1 2 3 4 5; do
+            [[ -s $ROOT_PASSWORD_FILE ]] && break
+            sleep 0.2
+        done
+        if [[ ! -s $ROOT_PASSWORD_FILE ]]; then
+            echo "prestart: diagnostic: ROOT_PASSWORD_FILE=$ROOT_PASSWORD_FILE (after $attempt attempts)" >&2
+            ls -la "$(dirname "$ROOT_PASSWORD_FILE")" >&2 2>&1 || echo "prestart: diagnostic: cannot list $(dirname "$ROOT_PASSWORD_FILE")" >&2
+            wc -c "$ROOT_PASSWORD_FILE" >&2 2>&1 || echo "prestart: diagnostic: cannot stat $ROOT_PASSWORD_FILE" >&2
+            echo "prestart: diagnostic: mount info for secrets dir:" >&2
+            mount 2>&1 | grep -i secret >&2 || echo "prestart: diagnostic: no 'secret' mount entries found" >&2
+            cat /proc/mounts 2>&1 | grep -i secret >&2 || echo "prestart: diagnostic: no 'secret' entries in /proc/mounts" >&2
+            echo "prestart: diagnostic: stat of secrets dir itself:" >&2
+            stat "$(dirname "$ROOT_PASSWORD_FILE")" >&2 2>&1
+            fail "Vault root password is empty"
+        fi
+
+            
+        
         local hash
         hash=$(openssl dgst -sha1 -binary "$ROOT_PASSWORD_FILE" |
             openssl dgst -sha1 -r | awk '{print "*" toupper($1)}')
         printf 'initial_root_password = %s\n' "$hash" >> "$conf"
         printf 'meta_dir = %s/fe/doris-meta\n' "$DORIS_HOME" >> "$conf"
     else
+
+        : "${BE_DISK_COUNT:?}"
+        [[ $BE_DISK_COUNT =~ ^[1-9][0-9]*$ ]] || fail "BE_DISK_COUNT must be a positive integer"
+        local paths="" i
+        for ((i = 1; i <= BE_DISK_COUNT; i++)); do
+            paths+="${paths:+;}$DORIS_HOME/be/storage/data$i"
+        done
+
+        
         printf 'storage_root_path = %s/be/storage\n' "$DORIS_HOME" >> "$conf"
+
     fi
     chmod 600 "$conf"
 }
