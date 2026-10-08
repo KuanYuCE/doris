@@ -1,8 +1,0 @@
-bash doris-nomad-pack/packs/doris/scripts/bootstrap-permit.sh  --dry-run "${ARGS[@]}"
-! Failed To Initialize Client
-!   Error: Error loading CA File: open ca.pem: no such file or directory
-!   Context:
-!     Registry Name: doris_packs
-!         Pack Name: doris
-!          Pack Ref: pack-template
-bootstrap-permit: nomad-pack render failed for doris (see the output above)
