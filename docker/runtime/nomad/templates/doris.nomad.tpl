@@ -160,6 +160,8 @@ job [[ var "job_name" . | quote ]] {
         # Named in the bootstrap error and read by scripts/bootstrap-permit.sh.
         META_VOLUME = "[[ template "blockVolumeName" (list "fe" $node.block_index 0) ]]"
         NODE_NAME   = [[ $node.hostname | quote ]]
+        EXISTING_FE_DISCOVERY_TIMEOUT = [[ var "existing_fe_discovery_timeout" $root | toString | quote ]]
+        MAX_CLOCK_SKEW_SECONDS        = [[ var "max_clock_skew_seconds" $root | toString | quote ]]
         [[ end ]]
       }
       [[ if eq $kind "fe" ]]

@@ -72,6 +72,18 @@ variable "discovery_timeout" {
   description = "Seconds to discover/register with an elected master before failing or using the bootstrap permit."
 }
 
+variable "existing_fe_discovery_timeout" {
+  type        = number
+  default     = 30
+  description = "Seconds an FE that already has metadata waits for an elected master to use as --helper before starting with a peer (or itself when it is the only FE)."
+}
+
+variable "max_clock_skew_seconds" {
+  type        = number
+  default     = 4
+  description = "Largest clock difference between an FE and the master allowed before the FE refuses to start; BDB rejects replicas beyond max_bdbje_clock_delta_ms (5 s)."
+}
+
 variable "fe_cpu" {
   type        = number
   default     = 2000

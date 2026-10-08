@@ -26,6 +26,8 @@ ROOT_PASSWORD_FILE=${ROOT_PASSWORD_FILE:-/secrets/root-password}
 CONFIG_OVERRIDES_FILE=${CONFIG_OVERRIDES_FILE:-}
 CONSUL_FE_FILE=${CONSUL_FE_FILE:-}
 DISCOVERY_TIMEOUT=${DISCOVERY_TIMEOUT:-300}
+EXISTING_FE_DISCOVERY_TIMEOUT=${EXISTING_FE_DISCOVERY_TIMEOUT:-30}
+MAX_CLOCK_SKEW_SECONDS=${MAX_CLOCK_SKEW_SECONDS:-4}
 POLL_INTERVAL=${POLL_INTERVAL:-2}
 BE_DISK_COUNT=${BE_DISK_COUNT:-}
 META_VOLUME=${META_VOLUME:-}
@@ -57,6 +59,66 @@ master_from() {
         $(c["Role"]) == "FOLLOWER" && $(c["EditLogPort"]) == "9010" {
             print $(c["Host"]); exit
         }'
+}
+
+lists_self() {
+    # Succeeds when SHOW FRONTENDS (stdin) has this node's own row.
+    awk -F '\t' -v host="$NODE_IP" '
+        NR == 1 { for (i=1; i<=NF; i++) c[$i]=i; next }
+        c["Host"] && c["EditLogPort"] && $(c["Host"]) == host && $(c["EditLogPort"]) == "9010" { found=1 }
+        END { exit !found }'
+}
+
+# Finds the elected master within $1 seconds, re-checked from the master's own
+# view. Sets master, master_rows and saw_master; fails on timeout.
+discover_master() {
+    local deadline=$((SECONDS + $1)) candidate rows verified
+    master="" master_rows="" saw_master=false
+    while ((SECONDS < deadline)); do
+        for candidate in "${candidates[@]}"; do
+            ((SECONDS < deadline)) || break
+            rows=$(sql "$candidate" 'SHOW FRONTENDS') || continue
+            master=$(master_from <<< "$rows")
+            [[ -n $master ]] || continue
+            validate_ip "$master"
+            saw_master=true
+            # Recheck the master's own view; it may have changed during discovery.
+            verified=$(sql "$master" 'SHOW FRONTENDS') || continue
+            [[ $(master_from <<< "$verified") == "$master" ]] || continue
+            master_rows=$verified
+            return 0
+        done
+        sleep "$POLL_INTERVAL"
+    done
+    master=""
+    return 1
+}
+
+check_clock() {
+    # BDB refuses a replica whose clock is more than max_bdbje_clock_delta_ms
+    # (5 s) from the master's, but only after ROLE and VERSION are written.
+    # Refuse before any metadata exists, with the cause in the allocation log.
+    local remote local_now skew
+    remote=$(sql "$1" 'SELECT UNIX_TIMESTAMP()' | awk 'NR == 2') ||
+        fail "Cannot read the clock of FE $1"
+    [[ $remote =~ ^[0-9]+$ ]] || fail "Cannot read the clock of FE $1"
+    local_now=$(date +%s)
+    skew=$((remote - local_now))
+    ((skew >= 0)) || skew=$((-skew))
+    ((skew <= MAX_CLOCK_SKEW_SECONDS)) ||
+        fail "Local clock differs from FE $1 by $skew s (limit $MAX_CLOCK_SKEW_SECONDS s); synchronize NTP on every Doris host before starting"
+}
+
+peer_helper() {
+    # BDB creates a new replication group only when a node's helper is the
+    # node itself. Naming a peer instead lets a healthy member start from its
+    # local group and makes a half-joined node fail and reschedule rather
+    # than silently found a second cluster. A single FE has no peer.
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        [[ $candidate == "$NODE_IP" ]] || { echo "$candidate"; return; }
+    done
+    echo "$NODE_IP"
 }
 
 write_endpoint() {
@@ -141,6 +203,8 @@ main() {
     : "${NODE_KIND:?}" "${NODE_IP:?}" "${BOOTSTRAP_IP:?}" "${FE_CANDIDATES:?}"
     [[ $NODE_KIND == fe || $NODE_KIND == be ]] || fail "NODE_KIND must be fe or be"
     [[ $DISCOVERY_TIMEOUT =~ ^[1-9][0-9]*$ ]] || fail "Invalid discovery timeout"
+    [[ $EXISTING_FE_DISCOVERY_TIMEOUT =~ ^[1-9][0-9]*$ ]] || fail "Invalid existing FE discovery timeout"
+    [[ $MAX_CLOCK_SKEW_SECONDS =~ ^[0-9]+$ ]] || fail "Invalid clock skew limit"
     validate_ip "$NODE_IP"
     validate_ip "$BOOTSTRAP_IP"
     local -a candidates
@@ -164,15 +228,33 @@ main() {
     for candidate in "${candidates[@]}"; do validate_ip "$candidate"; done
     prepare_config
 
-    local meta="$DORIS_HOME/fe/doris-meta"
+    local meta="$DORIS_HOME/fe/doris-meta" master master_rows saw_master
     if [[ $NODE_KIND == fe ]]; then
-        if [[ -f $meta/image/ROLE && -f $meta/image/VERSION ]]; then
-            # Do not wait for SQL/quorum: existing FEs must start concurrently.
-            write_endpoint "$NODE_IP"
-            return
-        fi
         if [[ -e $meta/image/ROLE || -e $meta/image/VERSION ]]; then
-            fail "Incomplete FE metadata; restore the volume before restarting"
+            # Doris writes ROLE, then VERSION, then image and BDB membership
+            # (Env.getClusterIdAndRole). Any interruption in between leaves a
+            # node that looks initialized but is not a BDB member; started
+            # with itself as helper it founds a one-node group and exits
+            # forever. With the elected master as helper, a healthy member
+            # reads its local group as usual while a half-joined one resumes
+            # the join exactly as a new node would. init_fe.sh passes
+            # FE_MASTER_IP != FE_CURRENT_IP as --helper.
+            if discover_master "$EXISTING_FE_DISCOVERY_TIMEOUT"; then
+                if [[ $master == "$NODE_IP" ]]; then
+                    write_endpoint "$NODE_IP"
+                    return
+                fi
+                # The master's list is persistent; a member is always on it.
+                lists_self <<< "$master_rows" ||
+                    fail "FE $NODE_IP has metadata but is not listed by master $master (dropped, or its IP changed); review the cluster before intervening"
+                check_clock "$master"
+                write_endpoint "$master"
+                return
+            fi
+            # Cold start or master outage: existing FEs must start
+            # concurrently to form a quorum.
+            write_endpoint "$(peer_helper)"
+            return
         fi
         # An image or BDB directory without identity is not an empty new node.
         if [[ -d $meta/bdb || -d $meta/image ]]; then
@@ -184,29 +266,18 @@ main() {
     # image entrypoint: in ASSIGN mode init_fe.sh / init_be.sh check SHOW
     # FRONTENDS / SHOW BACKENDS and run ALTER SYSTEM ADD FOLLOWER / BACKEND
     # for a node with empty metadata or storage, then start it.
-    local deadline=$((SECONDS + DISCOVERY_TIMEOUT)) master rows verified
-    local saw_master=false
-    while ((SECONDS < deadline)); do
-        for candidate in "${candidates[@]}"; do
-            ((SECONDS < deadline)) || break
-            rows=$(sql "$candidate" 'SHOW FRONTENDS') || continue
-            master=$(master_from <<< "$rows")
-            [[ -n $master ]] || continue
-            validate_ip "$master"
-            saw_master=true
-            # Recheck the master's own view; it may have changed during discovery.
-            verified=$(sql "$master" 'SHOW FRONTENDS') || continue
-            [[ $(master_from <<< "$verified") == "$master" ]] || continue
+    if discover_master "$DISCOVERY_TIMEOUT"; then
+        if [[ $NODE_KIND == fe ]]; then
             # init_fe.sh starts FE_MASTER_IP == FE_CURRENT_IP as a new master
             # without --helper. A node without metadata can never be the
             # elected master, so this would create a second cluster.
-            [[ $NODE_KIND == be || $master != "$NODE_IP" ]] ||
+            [[ $master != "$NODE_IP" ]] ||
                 fail "An FE without metadata is reported as master; check its volume"
-            write_endpoint "$master"
-            return
-        done
-        sleep "$POLL_INTERVAL"
-    done
+            check_clock "$master"
+        fi
+        write_endpoint "$master"
+        return
+    fi
 
     if [[ $NODE_KIND == fe && $NODE_IP == "$BOOTSTRAP_IP" && $saw_master == false ]]; then
         # Name the exact host volume so the operator never has to search for it.

@@ -95,3 +95,23 @@ environment for a standalone deployment example.
   render the MySQL option file and, for FE prestart, the raw password from
   which `initial_root_password` is derived. The plaintext password must remain
   available to the mysql clients in the entrypoints, prestart and ready.sh.
+
+## Existing FE helper selection and clock pre-check
+
+- Root cause of the restart loop: Doris writes ROLE and VERSION before joining
+  BDB; prestart treated them as a complete member and made the FE its own
+  helper, so a half-joined node founded a one-node group, elected itself and
+  exited at `checkCurrentNodeExist` on every allocation. Concurrent
+  `ADD FOLLOWER` is safe: the master excludes unready nodes from the quorum
+  (`BDBHA.addUnReadyElectableNode`).
+- Existing FEs now wait `existing_fe_discovery_timeout` (30 s) for the elected
+  master and start with it as `--helper`; without one they name a peer, never
+  themselves unless they are the only FE. A half-joined node resumes the join;
+  nothing is deleted or backed up. An FE missing from the master's list, and a
+  clock more than `max_clock_skew_seconds` (4) from the master's, fail before
+  any metadata is written.
+- No lock, no new dependency, no change to `init_fe.sh` or the images. The
+  `.bootstrap-approved` permit is unchanged. See FE-RECOVERY.md.
+- Validation: prestart and pack tests pass; no real Doris or Nomad run. Staging
+  must confirm cold start with a peer helper, resuming a half-joined FE, and
+  that a half-joined FE with an unreachable peer helper exits.

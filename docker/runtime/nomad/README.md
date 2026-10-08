@@ -52,7 +52,8 @@ Consul services
 | `SHOW FRONTENDS`/`SHOW BACKENDS` 檢查、`ALTER SYSTEM ADD FOLLOWER/BACKEND` | 原入口 | `init_fe.sh` 在 metadata 為空時執行；`init_be.sh` 只看 `storage/data`，多磁碟配置下資料在 `storage/data<N>/`，所以每次啟動都會先查 `SHOW BACKENDS`，已註冊就略過 |
 | 找出現任 master | prestart | ASSIGN 模式需要固定的 `FE_MASTER_IP`，原入口不會探索；master 會漂移 |
 | 決定是否 bootstrap 新叢集 | prestart | 原入口看到 `FE_MASTER_IP == FE_CURRENT_IP` 就以新 master 啟動，沒有防止第二個叢集的機制 |
-| 既有 FE 不等 quorum 直接放行 | prestart | 將 `FE_MASTER_IP` 設為自己，原入口直接啟動既有 metadata |
+| 為既有 FE 選 helper | prestart | 原入口把 `FE_MASTER_IP != FE_CURRENT_IP` 當作 `--helper`。prestart 在 `existing_fe_discovery_timeout` 內找現任 master 當 helper；找不到就用第一個不是自己的 seed（單 FE 時才用自己），見「重啟與 master 切換」 |
+| 與 master 比對時鐘 | prestart | BDB 在寫完 `ROLE`/`VERSION` 之後才檢查時鐘差（`max_bdbje_clock_delta_ms`，5 秒），失敗會留下半初始化的 metadata；prestart 先用 `SELECT UNIX_TIMESTAMP()` 比對，超過 `max_clock_skew_seconds` 就拒絕啟動 |
 | 複製設定、附加片段、`initial_root_password` | prestart | 原入口不支援設定片段或密碼 hash |
 
 代價：原入口的 `check_fe_registered` 在節點尚未註冊時會先輪詢 60 秒才執行
@@ -112,7 +113,11 @@ FQDN／部署模式等不能在片段覆寫，prestart 會報錯。
   container 內的 `/secrets/*` 會是空的；`MountFlags=shared` 也無法恢復傳播。
 - 範例 FE memory 為 16 GiB，以容納 image 常見的 8 GiB JVM heap；請對照實際 image
   與主機容量配置資源。FE 與 BE 同機時，兩者 reservation 必須都能滿足。
-- 依 Doris 正式部署要求預先設定主機，例如 BE 的 `vm.max_map_count`、磁碟、時鐘同步等。
+- 依 Doris 正式部署要求預先設定主機，例如 BE 的 `vm.max_map_count`、磁碟等。
+- **所有主機的時鐘必須已同步**（`chronyc tracking` 或 `timedatectl` 顯示 synchronized）。
+  FE 加入 BDB replication group 時，與 master 的時鐘差超過 `max_bdbje_clock_delta_ms`
+  （5 秒）會被拒絕；prestart 先比對，超過 `max_clock_skew_seconds`（預設 4）就以
+  `Local clock differs from FE ...` 失敗，不寫入任何 metadata。不要調高 Doris 的上限來繞過。
 
 支援 **Nomad Pack 0.4.1 以上**。模板從 root variable file 的絕對路徑推得 pack 目錄，
 再以 `fileContents` 讀取 `scripts/`；不使用 0.4.2 才提供的 `meta "pack.path"`。
@@ -328,9 +333,25 @@ allocation 失敗並重新排程。因此 `discovery_fe_ips` 仍為必填。
 
 ## 重啟與 master 切換
 
-既有 FE 的 `ROLE`、`VERSION` 都存在時，prestart 不等待 master，直接放行，讓 FEs
-同時啟動並自行選舉。缺失部分 identity files 或已有不完整 metadata 時會退出，
-不把它當作新叢集。
+本地已有 `ROLE` 或 `VERSION` 的 FE 視為既有 FE。Doris 加入叢集的順序是：向 helper
+查到角色後寫 `ROLE`、下載 `VERSION`、下載 image、最後才加入 BDB replication group。
+這中間任何一種中斷（時鐘差太大、HTTP 逾時、job 更新時被停止）都會留下「看起來
+已初始化、其實不是 BDB 成員」的 metadata；這種節點若用自己當 helper 啟動，會自建
+一個只有自己的 group、當選 master、在 journal 裡找不到自己而退出，每個新 allocation
+都重複一次。所以 prestart 為既有 FE 這樣選 helper：
+
+1. 在 `existing_fe_discovery_timeout`（預設 30 秒）內找現任 master。找到且不是自己
+   → `FE_MASTER_IP` 設為 master，原入口以 `--helper master` 啟動。健康成員會忽略 helper
+   的角色資訊、沿用本地 group；半加入的節點則接續走和新節點相同的加入流程，不需清理。
+   此時也會確認 master 的 `SHOW FRONTENDS` 列有自己：沒有就表示已被移出或 IP 變了，
+   明確失敗，由操作人員處理。
+2. master 就是自己 → 設為自己。
+3. 逾時找不到 master（全叢集冷啟動、master 故障中）→ 設為第一個不是自己的 seed，
+   讓所有既有 FE 同時啟動湊 quorum；只有單 FE 叢集才用自己。BDB 只在 helper 是
+   自己時才會建立新 group，所以半加入的節點此時只會逾時退出、等下一次排程，不會
+   變成第二個叢集。
+
+image 目錄存在卻沒有 `ROLE`/`VERSION` 時會退出，不把它當作新叢集。
 
 BE 每次新 allocation 都重新探索 master，新 BE 由原有 `init_be.sh` 註冊。
 原有 BE entrypoint 的 status check 只等 60 秒：FE 若在此時故障或 master 切換，
@@ -406,6 +427,27 @@ nomad-pack run "${ARGS[@]}"
 - 遠端主機必須擁有該節點的 IP；每個路徑都必須存在、是目錄、且不是 `/` 或第一層目錄
   （例如 `/data`），全部通過才刪除。只刪除目錄內容：保留目錄本身與 `lost+found`，
   不跨入其下掛載的其他檔案系統。
+
+### 只重置一台 FE
+
+需要手動重置單一 FE 的情況只剩兩種，都要操作人員判斷，pack 不自動清理：
+
+- **bootstrap FE 在首次啟動中途被中斷**（寫完 `VERSION`、還沒把自己寫進 journal）。
+  只在全新叢集發生。特徵：bootstrap FE 每個 allocation 都印
+  `is not added to the cluster, will exit`，而 prestart 因為找不到 master 且
+  permit 已消耗而失敗。處置：叢集沒有資料，照上面的流程 wipe 後重新 bootstrap。
+- **已被 `DROP FRONTEND` 移出或 IP 變更的 FE**：prestart 以
+  `has metadata but is not listed by master` 失敗。要重新加入時，先停止該 group，
+  在該主機清空 meta volume 內的 `image/` 與 `bdb/`（保留 volume 目錄本身），再讓
+  新 allocation 當作新節點加入：
+
+  ```bash
+  nomad job stop -namespace=doris doris      # 或只 stop 該 FE group 的 allocation
+  ssh <fe-host> 'rm -rf <meta volume>/image <meta volume>/bdb'
+  ```
+
+舊版 pack（既有 FE 一律以自己為 helper）留下的「自建 group」metadata 也屬於第二種：
+用 `--helper master` 啟動會因 group 不一致被拒絕，必須清掉 `image/` 與 `bdb/`。
 
 ## 密碼、資料卷與 bootstrap 的界線
 

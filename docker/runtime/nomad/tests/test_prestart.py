@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -30,6 +31,12 @@ FRONTENDS = (
     "IsHelper\tErrMsg\tVersion\tCurrentConnected\n"
     "fe2\ttrue\t10.0.0.2\t9010\t8030\t9030\t9020\tFOLLOWER\t123\ttrue\ttrue\t"
     "100\t2026-09-25\t2026-09-25\ttrue\t\t4.1.4\tYes\n"
+)
+# The node under test (10.0.0.3) as a registered follower; its row exists as
+# soon as ALTER SYSTEM ADD FOLLOWER runs, whether or not it ever joined BDB.
+SELF_ROW = (
+    "fe3\tfalse\t10.0.0.3\t9010\t8030\t9030\t9020\tFOLLOWER\t123\ttrue\tfalse\t"
+    "0\tN/A\tN/A\tfalse\t\t4.1.4\tNo\n"
 )
 
 
@@ -71,6 +78,10 @@ class PrestartTest(unittest.TestCase):
             "    if not table.exists():\n"
             "        table = base / 'frontends'\n"
             "    print(table.read_text(), end='')\n"
+            "elif sql == 'SELECT UNIX_TIMESTAMP()':\n"
+            "    import time\n"
+            "    print('UNIX_TIMESTAMP()')\n"
+            "    print(int(time.time()) + int(os.environ.get('TEST_MASTER_CLOCK_OFFSET', '0')))\n"
             "else:\n"
             "    sys.exit(2)\n"
         )
@@ -91,8 +102,17 @@ class PrestartTest(unittest.TestCase):
             # Bash SECONDS counts whole wall-clock seconds, so a deadline of 1
             # can expire almost immediately. 2 leaves at least one second.
             DISCOVERY_TIMEOUT="2",
+            EXISTING_FE_DISCOVERY_TIMEOUT="2",
             POLL_INTERVAL="0.1",
         )
+
+    def write_identity(self, *files):
+        if not files:
+            return
+        image = self.meta / "image"
+        image.mkdir(exist_ok=True)
+        for name in files:
+            (image / name).touch()
 
     def run_prestart(self):
         return subprocess.run(
@@ -114,8 +134,9 @@ class PrestartTest(unittest.TestCase):
         result = self.run_prestart()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.endpoint(), "10.0.0.2")
-        # init_fe.sh registers the follower; prestart only reads membership.
-        self.assertEqual(set(self.queries()), {"SHOW FRONTENDS"})
+        # init_fe.sh registers the follower; prestart only reads membership
+        # and compares clocks.
+        self.assertEqual(set(self.queries()), {"SHOW FRONTENDS", "SELECT UNIX_TIMESTAMP()"})
         conf = (self.data / "conf/fe.conf").read_text()
         self.assertIn("custom_option = preserved", conf)
         # MySQL PASSWORD("root@123"), as documented by Doris.
@@ -125,15 +146,91 @@ class PrestartTest(unittest.TestCase):
         self.assertEqual((self.data / "conf/fe_custom.conf").read_text(),
                          "priority_networks = 10.0.0.3/32\n")
 
-    def test_existing_fe_starts_without_reachable_peers(self):
-        image = self.meta / "image"
-        image.mkdir()
-        (image / "ROLE").touch()
-        (image / "VERSION").touch()
-        self.env["TEST_OFFLINE"] = "1"
+    def test_existing_fe_uses_elected_master_as_helper(self):
+        # A member that was interrupted after ROLE/VERSION but before joining
+        # BDB can only resume through a real helper; a healthy member ignores
+        # the helper's role information and reads its local group.
+        self.write_identity("ROLE", "VERSION")
+        (self.base / "frontends").write_text(FRONTENDS + SELF_ROW)
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.2")
+
+    def test_existing_fe_that_is_master_uses_itself(self):
+        self.write_identity("ROLE", "VERSION")
+        self.env["TEST_REACHABLE_HOSTS"] = "10.0.0.3"
+        (self.base / "frontends").write_text(FRONTENDS.replace("10.0.0.2", "10.0.0.3"))
         result = self.run_prestart()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.endpoint(), "10.0.0.3")
+
+    def test_existing_fe_without_reachable_peers_uses_a_peer_as_helper(self):
+        # Cold start: do not wait for the full discovery timeout, and never
+        # name itself as helper while another FE exists. BDB creates a new
+        # group only when the helper is the node itself, so a half-joined
+        # node fails and is rescheduled instead of becoming a second cluster.
+        self.write_identity("ROLE", "VERSION")
+        self.env.update(TEST_OFFLINE="1", DISCOVERY_TIMEOUT="6")
+        started = time.monotonic()
+        result = self.run_prestart()
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.1")
+        self.assertGreaterEqual(elapsed, 1)
+        self.assertLess(elapsed, 5)
+
+    def test_single_fe_cluster_restarts_as_its_own_helper(self):
+        self.write_identity("ROLE", "VERSION")
+        self.env.update(TEST_OFFLINE="1", FE_CANDIDATES="10.0.0.3")
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.3")
+
+    def test_half_joined_fe_with_only_role_resumes_from_master(self):
+        # ROLE is written before VERSION is downloaded; with a real helper the
+        # FE repeats the download instead of failing forever.
+        self.write_identity("ROLE")
+        (self.base / "frontends").write_text(FRONTENDS + SELF_ROW)
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.2")
+
+    def test_half_joined_fe_without_master_uses_a_peer_as_helper(self):
+        self.write_identity("ROLE")
+        self.env["TEST_OFFLINE"] = "1"
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.1")
+
+    def test_existing_fe_missing_from_master_list_fails(self):
+        # Removed from the cluster or started with a changed IP: starting it
+        # with any helper would rejoin or recreate a group. Operator decision.
+        self.write_identity("ROLE", "VERSION")
+        result = self.run_prestart()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not listed", result.stderr)
+        self.assertFalse((self.data / "endpoint.env").exists())
+
+    def test_clock_skew_with_master_fails_before_any_metadata(self):
+        # BDB rejects a replica whose clock differs from the master's by more
+        # than max_bdbje_clock_delta_ms (5 s) only after ROLE and VERSION are
+        # written. Refuse earlier, with the cause in the allocation log.
+        self.env["TEST_MASTER_CLOCK_OFFSET"] = "16"
+        for identity in ((), ("ROLE", "VERSION")):
+            with self.subTest(identity=identity):
+                self.write_identity(*identity)
+                (self.base / "frontends").write_text(FRONTENDS + SELF_ROW)
+                result = self.run_prestart()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("clock", result.stderr)
+                self.assertIn("16", result.stderr)
+                self.assertFalse((self.data / "endpoint.env").exists())
+
+    def test_clock_skew_within_threshold_passes(self):
+        self.env["TEST_MASTER_CLOCK_OFFSET"] = "-3"
+        result = self.run_prestart()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.endpoint(), "10.0.0.2")
 
     def test_empty_vault_password_fails(self):
         (self.base / "root-password").write_bytes(b"")
@@ -216,12 +313,15 @@ class PrestartTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.endpoint(), "10.0.0.4")
 
-    def test_partial_metadata_fails(self):
+    def test_image_without_identity_fails(self):
+        # Doris writes ROLE before anything else under image/; an image
+        # directory without it is not a state a new node may start over.
         (self.meta / "image").mkdir()
-        (self.meta / "image/ROLE").touch()
+        (self.meta / "image/image.0").touch()
         result = self.run_prestart()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Incomplete", result.stderr)
+        self.assertFalse((self.data / "endpoint.env").exists())
 
     def test_bootstrap_requires_and_consumes_explicit_permit(self):
         self.env.update(NODE_IP="10.0.0.1", TEST_OFFLINE="1",

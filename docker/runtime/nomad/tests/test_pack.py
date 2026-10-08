@@ -83,7 +83,14 @@ class PackTest(unittest.TestCase):
                 env = tasks["prepare"]["Env"]
                 self.assertEqual((env["META_VOLUME"], env["NODE_NAME"]),
                                  (sources["meta"], group["Name"][len("fe-"):]))
+                # Existing FEs wait less than new ones, and compare clocks
+                # with the master before writing any metadata.
+                self.assertEqual(env["EXISTING_FE_DISCOVERY_TIMEOUT"], "30")
+                self.assertEqual(env["MAX_CLOCK_SKEW_SECONDS"], "4")
             else:
+                env = tasks["prepare"]["Env"]
+                self.assertNotIn("EXISTING_FE_DISCOVERY_TIMEOUT", env)
+                self.assertNotIn("MAX_CLOCK_SKEW_SECONDS", env)
                 self.assertEqual(sources, {"storage1": "doris-be-b0-d0", "storage2": "doris-be-b0-d1"})
                 self.assertEqual(main_mounts, [
                     ("storage1", "/opt/apache-doris/be/storage/data1", False),
